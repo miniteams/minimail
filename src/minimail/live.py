@@ -2,7 +2,7 @@
 
 import sqlite3
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass
 
@@ -12,14 +12,14 @@ import structlog
 from .auth import AuthExpired, AuthUnavailable
 from .folders import sync_folders
 from .graph import SESSION_STATUSES, Graph
-from .mail import Counters, sync_folder
+from .mail import Counters, Reconciled, reconcile_steps, sync_folder
 
 log = structlog.get_logger()
 
 _SUMMED = ("listed", "downloaded", "failed", "moved", "deleted")
 # A folder's own failures (gone, forbidden, 5xx, refused or malformed page) skip that folder only.
 # Read/write timeouts are tied to one item (a huge or stuck $value); connect errors mean the network.
-_FOLDER_ERRORS = (httpx.HTTPStatusError, httpx.ReadTimeout, httpx.WriteTimeout, ValueError, RuntimeError)
+FOLDER_ERRORS = (httpx.HTTPStatusError, httpx.ReadTimeout, httpx.WriteTimeout, ValueError, RuntimeError)
 # SESSION_STATUSES back off the whole cycle; 503/504 stay per folder: one folder's backend can keep
 # failing while the others answer.
 # What a live cycle survives: sign-in and network outages, mailbox-wide throttling, Graph answering
@@ -39,6 +39,7 @@ class Cadence:
     inbox: float
     folders: float
     tree: float
+    reconcile: float = 86400.0
 
 
 def _round(
@@ -64,18 +65,17 @@ def _attempt(
     """`_round`, or None (logged) if the folder failed on its own; mailbox-wide failures propagate."""
     try:
         return _round(graph, db, executor, folder, pause)
-    except _FOLDER_ERRORS as exc:
-        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
-        if isinstance(exc, AuthExpired | AuthUnavailable) or status in SESSION_STATUSES:
-            raise
-        log.warning(
-            "folder_round_failed",
-            path=folder["path"],
-            error=type(exc).__name__,
-            status=status,
-            detail=str(exc)[:200],
-        )
+    except FOLDER_ERRORS as exc:
+        folder_failed(exc, folder, "folder_round_failed")
         return None
+
+
+def folder_failed(exc: Exception, folder: sqlite3.Row, event: str) -> None:
+    """Log a failure of the folder itself; re-raise a mailbox-wide one."""
+    status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+    if isinstance(exc, AuthExpired | AuthUnavailable) or status in SESSION_STATUSES:
+        raise exc
+    log.warning(event, path=folder["path"], error=type(exc).__name__, status=status, detail=str(exc)[:200])
 
 
 def sync_pass(
@@ -105,9 +105,14 @@ def run_live(
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """Folder tree every `cadence.tree`, Inbox every `cadence.inbox`, the other folders every
-    `cadence.folders`. Survives sign-in and Graph outages (retries one Inbox interval later); stops
-    when `wait` returns True or on KeyboardInterrupt (SIGINT/SIGTERM)."""
+    `cadence.folders`, a reconcile pass of every folder every `cadence.reconcile` (after the other
+    folders, yielding to the Inbox like them). Survives sign-in and Graph outages (retries one Inbox
+    interval later); stops when `wait` returns True or on KeyboardInterrupt (SIGINT/SIGTERM)."""
     due_tree = due_inbox = due_folders = clock()
+    # The start-up pass is already the heaviest; `minimail reconcile` covers an immediate need.
+    due_reconcile = due_folders + cadence.reconcile
+    to_reconcile: list[sqlite3.Row] = []
+    job: tuple[Iterator[None], Reconciled] | None = None  # the folder reconcile in progress
     inbox: list[sqlite3.Row] = []
     others: list[sqlite3.Row] = []
     pending: list[sqlite3.Row] = []  # other folders still owed a round in the current pass
@@ -165,10 +170,33 @@ def run_live(
                         break
                     pending.pop(0)
                 due_folders = clock() + (0 if pending else cadence.folders)
+            if walked and not pending and now >= due_reconcile:
+                if not to_reconcile:
+                    to_reconcile = [*inbox, *others]
+                while to_reconcile and not inbox_due():
+                    folder = to_reconcile[0]
+                    if job is None:
+                        c = Reconciled()
+                        job = (reconcile_steps(graph, db, folder["id"], c), c)
+                    try:
+                        next(job[0])
+                        continue
+                    except StopIteration:
+                        log.info("folder_reconciled", path=folder["path"], **job[1].summary())
+                    except FOLDER_ERRORS as exc:
+                        job = None  # a generator that raised is finished; a mailbox-wide error retries it
+                        folder_failed(exc, folder, "folder_reconcile_failed")
+                    job = None
+                    to_reconcile.pop(0)
+                if not to_reconcile:
+                    due_reconcile = clock() + cadence.reconcile
         except _RETRIED as exc:
             log.warning("live_cycle_failed", error=type(exc).__name__, detail=str(exc)[:200])
+            job = None  # restarts the folder being reconciled
             # Every task waits at least one Inbox interval: no hot loop against a dead endpoint.
             retry = clock() + cadence.inbox
-            due_tree, due_inbox, due_folders = (max(d, retry) for d in (due_tree, due_inbox, due_folders))
-        if wait(max(0.0, min(due_tree, due_inbox, due_folders) - clock())):
+            due_tree, due_inbox, due_folders, due_reconcile = (
+                max(d, retry) for d in (due_tree, due_inbox, due_folders, due_reconcile)
+            )
+        if wait(max(0.0, min(due_tree, due_inbox, due_folders, due_reconcile) - clock())):
             return

@@ -372,3 +372,52 @@ def test_folder_listings_never_print_terminal_controls(
         assert "evil" in out, argv
         assert not [line for line in out.splitlines() if line.startswith("fake")], argv
         assert not any(bad in out for bad in ("\x1b", "\x07", "\x9b", "\u202e")), argv
+
+
+def test_reconcile_marks_what_the_server_no_longer_lists(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """001-AC5: `minimail reconcile` tombstones a local message its folder no longer lists."""
+    from .test_mail import FakeGraph, item
+
+    fake = FakeGraph([[item("m1"), item("m2")]])
+    _seed(env, monkeypatch, fake)
+    assert cli.main(["sync"]) == 0
+    capsys.readouterr()
+    fake.listing = {"F1": ["m1"]}
+    fake.messages = {"m2": 404}
+    assert cli.main(["reconcile", "--folder", "Inbox"]) == 0
+    out = capsys.readouterr().out
+    assert "1 folders, 0 failed, 1 messages on the server: 1 marked deleted, 0 moved, 0 restored" in out
+    assert cli.main(["reconcile", "--folder", "Nope"]) == 2
+
+
+def test_reconcile_isolates_a_failing_folder_and_exits_1(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """001-AC5: a folder whose listing fails is logged; the others are still reconciled; exit 1."""
+    from .test_mail import FakeGraph, item
+
+    fake = FakeGraph([[item("m1"), item("m2")]])
+    _seed(env, monkeypatch, fake)
+    assert cli.main(["sync"]) == 0
+    capsys.readouterr()
+    fake.listing = {"F1": ["m1"]}
+    fake.messages = {"m2": 404}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path.endswith("/mailFolders/F0/messages"):
+            return httpx.Response(403)
+        return fake(req)
+
+    seeded = cli.sync_folders
+
+    def folders(graph: object, db: sqlite3.Connection) -> list[sqlite3.Row]:
+        rows: list[sqlite3.Row] = seeded(graph, db)  # type: ignore[arg-type]
+        db.execute("INSERT OR IGNORE INTO folders (id, display_name, path) VALUES ('F0', 'Bad', 'Bad')")
+        return [db.execute("SELECT * FROM folders WHERE id='F0'").fetchone(), *rows]
+
+    monkeypatch.setattr(cli, "sync_folders", folders)
+    monkeypatch.setattr(cli, "_graph", lambda settings: make_graph(handler))
+    assert cli.main(["reconcile"]) == 1
+    assert "2 folders, 1 failed, 1 messages on the server: 1 marked deleted" in capsys.readouterr().out

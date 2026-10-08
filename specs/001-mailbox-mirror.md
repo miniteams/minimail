@@ -122,7 +122,10 @@ is lost locally.
   yield between rounds, pages and catch-up chunks once the Inbox is due; a failing folder is skipped
   for the rest of the pass; a failed cycle (including at start-up) is logged and retried one Inbox
   interval later; client-side request pacing (`MINIMAIL_MAX_RPS`); clean stop on SIGINT/SIGTERM
-  (exit 130); `--live` refuses `--folder`.
+  (exit 130); `--live` refuses `--folder`. Reconciliation: `minimail reconcile [--folder PATH]…` and,
+  in `--live`, a pass over every folder every `MINIMAIL_RECONCILE_EVERY` (default 1 day, first one a
+  day after start-up), after the other folders and yielding to the Inbox like them; an item whose
+  `$value` and `GET` both 404 is a tombstone, never a live message.
 - **Covers**: AC4, AC5, AC6
 - **Data model impact**: none (`sync_state` arrives in phase 2)
 - **DoD**: live test: send self a mail → searchable < 60 s; delete/move/flag one → reflected without a
@@ -227,10 +230,22 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
   whole cycle, which is retried one Inbox interval later. A failed tree walk aborts the cycle only
   before the first successful walk; afterwards it is logged, the previous tree keeps serving and
   the walk is retried one tree interval later.
+- **Reconcile beside delta**: Graph's message delta never reports a message leaving Deleted Items by a
+  delete (soft delete into Recoverable Items): the cursor moves past it with no `@removed`. So a
+  reconcile lists each folder's ids (`messages?$select=id`) and sends every live local id the server
+  no longer lists through the `@removed` logic (404 or hidden parent → tombstone, visible folder →
+  move); a lookup also clears a false hit (a message stored after the listing). A local tombstone the
+  server still lists in that folder (lookup confirms the parent) is revived: a false tombstone (a
+  transient 404, a stale tree) heals and the catch-up fetches its missing MIME. Server ids stored
+  nowhere are only counted: additions stay the delta's. In `--live` a unit is one listing page or up to 100
+  lookups, so the AC4 bound holds; a paused folder resumes its listing, a folder failing on its own
+  is skipped for that pass. Deleted Items' delta also lists non-mail items typed as messages that
+  `/messages` does not list (`$value` and `GET` 404): stored as tombstones without `mime_error`, so
+  AC1 never counts them and a fresh round that lists them again re-checks and re-tombstones them.
 - **Delta links are checked before they are stored**: a nextLink/deltaLink off the Graph host is
   refused before the page is applied, so it never becomes the folder's saved cursor.
 - **Search index = external-content FTS5 + triggers**: no second copy of the text. Created and filled
-  (`'rebuild'`) in place by the first writer command (`sync`, `folders`, `verify`, `reindex`), under the
+  (`'rebuild'`) in place by the first writer command (`sync`, `folders`, `verify`, `reconcile`, `reindex`), under the
   write lock, re-checked once held, like `message_count`; `search`/`show`/`attachments` open read-only
   and refuse an archive not yet migrated (exit 2). Its rows
   key on `messages.rowid`, which a VACUUM may renumber (no INTEGER PRIMARY KEY): `reindex` rebuilds

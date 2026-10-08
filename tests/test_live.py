@@ -55,6 +55,7 @@ class LiveGraph(FakeGraph):
         self.broken: int | Exception | httpx.Response | None = None  # every call answers or raises this
         # folder id → how its delta calls fail: a status, "non_json", "malformed" or "off_host"
         self.failing: dict[str, int | str | Exception] = {}
+        self.list_fail: dict[str, int | Exception] = {}  # folder id → its reconcile listing's failure
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
         if isinstance(self.broken, Exception):
@@ -97,6 +98,15 @@ class LiveGraph(FakeGraph):
             else:
                 body["@odata.deltaLink"] = f"{link}?deltatoken=t"
             return httpx.Response(200, json=body)
+        if path.startswith("me/mailFolders/") and path.endswith("/messages"):
+            folder = path.split("/")[2]
+            self.events.append((self.clock.now, f"list:{folder}"))
+            self.clock.now += self.cost.get(f"list:{folder}", 0.0)
+            fail = self.list_fail.get(folder)
+            if isinstance(fail, Exception):
+                raise fail
+            if fail:
+                return httpx.Response(fail)
         if path.endswith("/$value"):
             self.events.append((self.clock.now, f"$value:{path.split('/')[2]}"))
         return super().__call__(req)
@@ -470,3 +480,73 @@ def test_cycle_failure_keeps_the_folder_owed(db: sqlite3.Connection, pool: Threa
 
     run_live(make_graph(flaky), db, pool, CADENCE, wait=waiter(clock, waits, stop), clock=clock)
     assert _deltas(fake) == [(0, "tree"), (0, "INBOX:0"), (0, "F2:0"), (30, "INBOX:0"), (30, "F3:0")]
+
+
+def test_reconcile_runs_after_the_others_and_yields_to_the_inbox(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """001-AC5, 001-AC4: every `reconcile` seconds each folder is reconciled, after the other folders'
+    pass, pausing between listing pages once the Inbox is due and resuming the same listing."""
+    clock = Clock()
+    fake = LiveGraph(clock)
+    fake.listing = {"F2": ["a", "b", "c", "d", "e"]}
+    fake.cost["list:F2"] = 20.0
+    waits: list[float] = []
+    cadence = Cadence(inbox=30.0, folders=300.0, tree=900.0, reconcile=100.0)
+    with capture_logs() as logs:
+        run_live(
+            make_graph(fake),
+            db,
+            pool,
+            cadence,
+            wait=waiter(clock, waits, lambda: clock.now >= 250),
+            clock=clock,
+        )
+    done = [set(e) - {"event", "log_level", "path"} for e in logs if e["event"] == "folder_reconciled"]
+    assert done == [{"listed", "moved", "deleted", "revived", "unsynced"}] * 2
+    # Due at 100; the F2 page ending at 120 hits the Inbox's due time: the Inbox runs, then page 2.
+    assert [e for t, e in fake.events if 100 <= t <= 140] == [
+        "list:INBOX",
+        "list:F2",
+        "INBOX:0",
+        "list:F2",
+        "list:F2",
+    ]
+    assert [t for t, e in fake.events if e == "list:INBOX"] == [100]  # next pass due at 260
+
+
+@pytest.mark.parametrize(
+    ("status", "event"),
+    [
+        (500, "folder_reconcile_failed"),
+        (429, "live_cycle_failed"),
+        (httpx.ConnectError("network down"), "live_cycle_failed"),
+    ],
+)
+def test_a_failing_reconcile_skips_its_folder_or_retries_the_cycle(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, status: int | Exception, event: str
+) -> None:
+    """001-AC5: a folder failing on its own is skipped, the next one still reconciled; a mailbox-wide
+    failure backs off the cycle and restarts the folder's listing."""
+    clock = Clock()
+    fake = LiveGraph(clock)
+    fake.folders["F3"] = [[]]
+    fake.list_fail = {"F2": status}
+    waits: list[float] = []
+
+    def stop() -> bool:
+        if clock.now >= 160:
+            fake.list_fail.clear()
+        return clock.now >= 250
+
+    cadence = Cadence(inbox=30.0, folders=300.0, tree=900.0, reconcile=150.0)
+    with capture_logs() as logs:
+        run_live(make_graph(fake), db, pool, cadence, wait=waiter(clock, waits, stop), clock=clock)
+    assert event in [e["event"] for e in logs]
+    lists = [e for _, e in _calls(fake, "list")]
+    assert lists[-2:] == ["list:F2", "list:F3"] and lists.count("list:F3") == 1
+    assert lists.count("list:INBOX") == 1  # a retried cycle resumes at the failed folder
+    if status == 500:
+        assert lists == ["list:INBOX", "list:F2", "list:F3"]
+    else:  # F2 listed again once the failure clears (at 160), not counted as reconciled
+        assert [t for t, e in _calls(fake, "list:F2")][-1] >= 160

@@ -8,7 +8,7 @@ A crash re-reads at most one page; messages whose MIME is already stored are nev
 import hashlib
 import json
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from compression import zstd
 from concurrent.futures import Executor, as_completed
 from dataclasses import dataclass
@@ -50,6 +50,15 @@ class Counters:
 
 
 @dataclass
+class Reconciled(Counters):
+    revived: int = 0
+    unsynced: int = 0  # listed by the server, stored nowhere: the delta owns additions
+
+    def summary(self) -> dict[str, int]:
+        return {k: getattr(self, k) for k in ("listed", "moved", "deleted", "revived", "unsynced")}
+
+
+@dataclass
 class Stored:
     id: str
     blob: bytes | None = None
@@ -57,6 +66,7 @@ class Stored:
     size: int | None = None
     text: str | None = None
     error: str | None = None
+    gone: bool = False
 
 
 def _now() -> str:
@@ -84,12 +94,26 @@ def fetch_mime(graph: Graph, msg_id: str) -> Stored:
         # client's own retries stop the round so a later one fetches it.
         if exc.response.status_code not in _PERMANENT:
             raise
+        if exc.response.status_code == 404 and _missing(graph, msg_id):
+            # Not a message (Deleted Items' delta lists items /messages does not) or deleted since
+            # listed: a tombstone, never a live row inflating the AC1 count.
+            return Stored(msg_id, gone=True)
         return Stored(msg_id, error=f"http {exc.response.status_code}")
     try:
         text = extract(raw).text
     except Exception:  # noqa: BLE001 — unparseable MIME is still archived verbatim
         text = Extracted().text
     return Stored(msg_id, zstd.compress(raw), hashlib.sha256(raw).hexdigest(), len(raw), text)
+
+
+def _missing(graph: Graph, msg_id: str) -> bool:
+    try:
+        graph.get(f"me/messages/{path_id(msg_id)}", **{"$select": "id"})
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 404:
+            raise
+        return True
+    return False
 
 
 def _upsert_meta(db: sqlite3.Connection, folder_id: str, item: dict[str, Any], now: str) -> None:
@@ -153,7 +177,7 @@ def _handle_removed(graph: Graph, db: sqlite3.Connection, folder_id: str, msg_id
 
 
 def _store_downloads(
-    graph: Graph, db: sqlite3.Connection, executor: Executor, ids: Iterable[str], c: Counters
+    graph: Graph, db: sqlite3.Connection, executor: Executor, folder_id: str, ids: Iterable[str], c: Counters
 ) -> None:
     futures = {executor.submit(fetch_mime, graph, msg_id) for msg_id in ids}
     # as_completed drops its reference to each future it yields; ours must go too, or every MIME of
@@ -171,11 +195,16 @@ def _store_downloads(
             continue
         with db:
             db.execute(
-                """UPDATE messages SET mime=?, mime_sha256=?, mime_size=?, mime_error=?, search_text=?
+                """UPDATE messages SET mime=?, mime_sha256=?, mime_size=?, mime_error=?, search_text=?,
+                     deleted_at=CASE WHEN ? THEN COALESCE(deleted_at, ?) ELSE deleted_at END
                    WHERE id=?""",
-                (s.blob, s.sha256, s.size, s.error, s.text, s.id),
+                (s.blob, s.sha256, s.size, s.error, s.text, s.gone, _now(), s.id),
             )
-        if s.error:
+        if s.gone:
+            # No mime_error: a relisted item is fetched (and tombstoned) again, never left live.
+            c.deleted += 1
+            log.warning("item_gone", folder_id=folder_id)
+        elif s.error:
             c.failed += 1
             log.warning("mime_unavailable", error=s.error)
         else:
@@ -211,7 +240,7 @@ def _apply_page(
                 [i["id"] for i in live],
             )
         ]
-        _store_downloads(graph, db, executor, need, c)
+        _store_downloads(graph, db, executor, folder_id, need, c)
 
 
 def _save_cursor(db: sqlite3.Connection, key: str, next_link: str | None, delta_link: str | None) -> None:
@@ -260,7 +289,7 @@ def _catch_up(
     for start in range(0, len(missing), PAGE_SIZE):
         if pause is not None and pause():
             return False
-        _store_downloads(graph, db, executor, missing[start : start + PAGE_SIZE], c)
+        _store_downloads(graph, db, executor, folder_id, missing[start : start + PAGE_SIZE], c)
     return True
 
 
@@ -316,6 +345,67 @@ def sync_folder(
             return c
         else:
             raise RuntimeError("delta page carries neither nextLink nor deltaLink")
+
+
+def reconcile_steps(graph: Graph, db: sqlite3.Connection, folder_id: str, c: Reconciled) -> Iterator[None]:
+    """Compare a folder's server ids to its live local ids; yields after each unit of work (a listing
+    page, up to a page of lookups) so a caller can pause between them. Delta never reports a soft
+    delete out of Deleted Items: a local id the server no longer lists goes through `_handle_removed`."""
+    server: set[str] = set()
+    for page in graph.pages(f"me/mailFolders/{path_id(folder_id)}/messages", **{"$select": "id"}):
+        server.update(i["id"] for i in page.get("value", []))
+        yield
+    c.listed = len(server)
+    local: set[str] = set()
+    tombstoned: set[str] = set()
+    for msg_id, deleted_at in db.execute(
+        "SELECT id, deleted_at FROM messages WHERE folder_id=?", (folder_id,)
+    ):
+        (local if deleted_at is None else tombstoned).add(msg_id)
+    unknown = sorted(server - local)
+    for start in range(0, len(unknown), 500):  # SQLite caps bound parameters
+        chunk = unknown[start : start + 500]
+        stored = db.execute(
+            f"SELECT COUNT(*) FROM messages WHERE id IN ({','.join('?' * len(chunk))})", chunk
+        )
+        c.unsynced += len(chunk) - stored.fetchone()[0]
+    if c.unsynced:
+        log.info("reconcile_unsynced", folder_id=folder_id, count=c.unsynced)
+    # A message stored after the listing is looked up too: the lookup finds it in place, a no-op.
+    lookups = [(m, False) for m in sorted(local - server)] + [(m, True) for m in sorted(server & tombstoned)]
+    for n, (msg_id, revive) in enumerate(lookups, 1):
+        if revive:
+            c.revived += _revive(graph, db, folder_id, msg_id)
+        else:
+            _handle_removed(graph, db, folder_id, msg_id, c)
+        if n % PAGE_SIZE == 0:
+            yield
+
+
+def _revive(graph: Graph, db: sqlite3.Connection, folder_id: str, msg_id: str) -> int:
+    """A tombstone the server still lists here was a false one (a transient 404, a stale tree):
+    live again, so the catch-up fetches its MIME if it has none."""
+    try:
+        current = graph.get(f"me/messages/{path_id(msg_id)}", **{"$select": "id,parentFolderId"})
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 404:
+            raise
+        return 0
+    if current["parentFolderId"] != folder_id:
+        return 0
+    with db:
+        return db.execute(
+            "UPDATE messages SET deleted_at=NULL, updated_at=? "
+            "WHERE id=? AND folder_id=? AND deleted_at IS NOT NULL",
+            (_now(), msg_id, folder_id),
+        ).rowcount
+
+
+def reconcile_folder(graph: Graph, db: sqlite3.Connection, folder_id: str) -> Reconciled:
+    c = Reconciled()
+    for _ in reconcile_steps(graph, db, folder_id, c):
+        pass
+    return c
 
 
 def local_counts(db: sqlite3.Connection) -> dict[str, int]:

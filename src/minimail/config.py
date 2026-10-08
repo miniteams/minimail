@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     inbox_every: float = Field(default=30.0, gt=0)
     folders_every: float = Field(default=300.0, gt=0)
     tree_every: float = Field(default=900.0, gt=0)
+    reconcile_every: float = Field(default=86400.0, gt=0)
     # Graph's per-app-per-mailbox quota is shared with the user's own Teams client (same app id).
     max_rps: float = Field(default=8.0, gt=0)
 

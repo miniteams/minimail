@@ -24,9 +24,9 @@ from .auth import AuthExpired, AuthUnavailable, TokenSource
 from .config import Settings
 from .folders import sync_folders
 from .graph import Graph
-from .live import Cadence, run_live, sync_pass
+from .live import FOLDER_ERRORS, Cadence, folder_failed, run_live, sync_pass
 from .logging import setup_logging
-from .mail import DOWNLOAD_WORKERS, local_counts, path_id, retry_failed
+from .mail import DOWNLOAD_WORKERS, Reconciled, local_counts, path_id, reconcile_folder, retry_failed
 from .mime import Attachment, attachments, body_text, extract, header, parse
 from .search import resolve, search, short_id
 from .store import needs_migration, open_db, open_readonly, rebuild_fts
@@ -107,7 +107,12 @@ def cmd_sync(settings: Settings, db: sqlite3.Connection, args: argparse.Namespac
                 graph,
                 db,
                 executor,
-                Cadence(settings.inbox_every, settings.folders_every, settings.tree_every),
+                Cadence(
+                    settings.inbox_every,
+                    settings.folders_every,
+                    settings.tree_every,
+                    settings.reconcile_every,
+                ),
             )
         else:
             total = sync_pass(graph, db, executor, selected)
@@ -121,6 +126,37 @@ def cmd_sync(settings: Settings, db: sqlite3.Connection, args: argparse.Namespac
     if not args.live:
         _print_folders(db, selected)
     return 0
+
+
+def cmd_reconcile(settings: Settings, db: sqlite3.Connection, args: argparse.Namespace) -> int:
+    graph = _graph(settings)
+    try:
+        # A fresh tree: a parent the last walk has not seen would read as a deletion.
+        folders = sync_folders(graph, db)
+        selected = [f for f in folders if not args.folder or f["path"] in args.folder]
+        if args.folder and len(selected) != len(set(args.folder)):
+            print(f"minimail: unknown folder path among {args.folder}", file=sys.stderr)
+            return 2
+        total = Reconciled()
+        failed = 0
+        for folder in selected:
+            try:
+                c = reconcile_folder(graph, db, folder["id"])
+            except FOLDER_ERRORS as exc:
+                folder_failed(exc, folder, "folder_reconcile_failed")
+                failed += 1
+                continue
+            log.info("folder_reconciled", path=folder["path"], **c.summary())
+            for name, value in c.summary().items():
+                setattr(total, name, getattr(total, name) + value)
+    finally:
+        graph.close()
+    print(
+        f"{len(selected)} folders, {failed} failed, {total.listed} messages on the server: "
+        f"{total.deleted} marked deleted, {total.moved} moved, {total.revived} restored, "
+        f"{total.unsynced} not synced yet"
+    )
+    return 1 if failed else 0
 
 
 def cmd_verify(settings: Settings, db: sqlite3.Connection, args: argparse.Namespace) -> int:
@@ -324,6 +360,12 @@ def _parser() -> argparse.ArgumentParser:
     sync.add_argument("--live", action="store_true", help="keep syncing forever (Ctrl-C / SIGTERM stops)")
     sync.add_argument("--retry-failed", action="store_true", help="retry messages whose download failed")
     sync.add_argument("--folder", action="append", metavar="PATH", help="only this folder path (repeatable)")
+    reconcile = sub.add_parser(
+        "reconcile", help="mark deleted/moved the local messages a folder no longer lists on the server"
+    )
+    reconcile.add_argument(
+        "--folder", action="append", metavar="PATH", help="only this folder path (repeatable)"
+    )
     verify = sub.add_parser("verify", help="check every stored MIME against its sha256")
     verify.add_argument(
         "--refetch", type=int, default=0, metavar="N", help="also compare N random messages to the server"
@@ -352,6 +394,7 @@ READERS = frozenset({"search", "show", "attachments"})
 COMMANDS: dict[str, Callable[[Settings, sqlite3.Connection, argparse.Namespace], int]] = {
     "folders": cmd_folders,
     "sync": cmd_sync,
+    "reconcile": cmd_reconcile,
     "verify": cmd_verify,
     "reindex": cmd_reindex,
     "search": cmd_search,

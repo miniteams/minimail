@@ -20,6 +20,7 @@ Sign-in is miniteams' (`miniteams login`): minimail only reads tokens from its M
 | `uv run minimail folders` | Sync the folder tree; print per folder the server item count, the server message count (`?` if Graph would not count it) and the local count; `≠` marks a local count that differs from the message count (from the item count when there is none) |
 | `uv run minimail sync [--folder PATH]… [--retry-failed]` | Mirror messages (verbatim MIME + metadata). First run = full backfill, then incremental; resumes after a crash |
 | `uv run minimail sync --live [--retry-failed]` | Same, forever: Inbox every 30 s, other folders every 5 min, folder tree every 15 min. Other folders yield to the Inbox between pages; a folder that keeps failing (Inbox included) is logged and does not hold the others back; a failed tree refresh keeps the previous tree; a failed cycle (sign-in, network, throttling, archive disk), even at start-up, is logged and retried 30 s later. Ctrl-C / SIGTERM stops it (exit 130). Takes no `--folder` |
+| `uv run minimail reconcile [--folder PATH]…` | Sync the folder tree, then compare each folder's server message ids to the local ones: a local message the server no longer lists is marked deleted (gone, or soft-deleted out of sight) or moved; a local message marked deleted that the server still lists there is restored (its MIME, if missing, is fetched by the next `sync`); server messages stored nowhere are only counted (`sync` fetches them). A folder that fails is logged and the others still run (exit 1). Catches deletions Graph's delta never reports (deleting from Deleted Items). Stop `sync --live` first (single writer) |
 | `uv run minimail verify [--refetch N]` | Check every stored MIME against its sha256; `--refetch N` compares N random messages to the server byte for byte |
 | `uv run minimail reindex` | Rebuild the search index, then recompute search text from stored MIME, no download (stop `sync` first: single writer) |
 | `uv run minimail search QUERY [--folder PATH] [--limit N] [--deleted] [--json]` | Full-text search over subject, sender, recipients and decoded text, accent- and case-insensitive; words are ANDed, operators and punctuation are plain text (`--` before a query starting with `-`). Newest first, 20 hits by default, messages deleted on the server only with `--deleted`. Per hit: short id, date (UTC), folder, sender, subject, then a snippet; `--json`: one object per line |
@@ -37,6 +38,7 @@ Sign-in is miniteams' (`miniteams login`): minimail only reads tokens from its M
 | `MINIMAIL_INBOX_EVERY` | `30` | `sync --live`: seconds between Inbox rounds, and the retry delay after a failed cycle |
 | `MINIMAIL_FOLDERS_EVERY` | `300` | `sync --live`: seconds between rounds of the other folders |
 | `MINIMAIL_TREE_EVERY` | `900` | `sync --live`: seconds between folder tree refreshes |
+| `MINIMAIL_RECONCILE_EVERY` | `86400` | `sync --live`: seconds between reconcile passes over every folder (first one after this delay); low priority, yields to the Inbox |
 | `MINIMAIL_MAX_RPS` | `8` | Graph requests started per second, all threads together; a throttled (429/503/504) answer holds every thread back for its `Retry-After` (capped at 60 s). The quota (~10k requests / 10 min per app and mailbox) is shared with the Teams client, whose app id minimail borrows |
 
 Exit codes: `2` no usable token, missing/invalid setting, unknown `--folder`, `--live` with `--folder`,
@@ -45,7 +47,7 @@ error (e.g. locked by another writer; traceback in the log), `verify` mismatch, 
 is not stored or is too deeply nested to parse (`show --raw` still works), or attachments that cannot
 be written, `130` interrupted (Ctrl-C / SIGTERM).
 
-The first `sync`, `folders`, `verify` or `reindex` run after upgrading to the search index builds it
+The first `sync`, `folders`, `verify`, `reconcile` or `reindex` run after upgrading to the search index builds it
 from the stored messages, holding the archive's write lock meanwhile: stop `sync --live` first (single
 writer; otherwise either side may fail with `database is locked`; rerun it). Until then `search`,
 `show` and `attachments` refuse the old archive (exit 2).

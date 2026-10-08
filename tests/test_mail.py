@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
 from minimail import mail
 from minimail.auth import AuthExpired, AuthUnavailable
@@ -48,8 +49,9 @@ class FakeGraph:
         self.break_value: set[str] = set()  # ids whose download dies on the wire
         self.raise_value: dict[str, Exception] = {}  # ids whose download raises this
         self.gone_links: set[str] = set()
-        self.messages: dict[str, int | str] = {}  # GET /me/messages/{id}: status or parentFolderId
+        self.messages: dict[str, int | str] = {}  # GET /me/messages/{id}: status or parentFolderId (FOLDER)
         self.slow: set[str] = set()  # ids whose download completes last
+        self.listing: dict[str, list[str]] = {}  # GET mailFolders/{id}/messages: ids, two per page
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
         url = str(req.url)
@@ -68,10 +70,16 @@ class FakeGraph:
                 return httpx.Response(self.fail_value[msg_id])
             return httpx.Response(200, content=mime_for(msg_id))
         if path.startswith("me/messages/"):
-            state = self.messages[path.split("/")[2]]
+            state = self.messages.get(path.split("/")[2], FOLDER)
             if isinstance(state, int):
                 return httpx.Response(state, json={"error": {"code": "ErrorItemNotFound"}})
             return httpx.Response(200, json={"id": "x", "parentFolderId": state})
+        if path.startswith("me/mailFolders/") and path.endswith("/messages"):
+            ids, skip = self.listing.get(path.split("/")[2], []), int(req.url.params.get("skip", "0"))
+            listed: dict[str, Any] = {"value": [{"id": i} for i in ids[skip : skip + 2]]}
+            if skip + 2 < len(ids):
+                listed["@odata.nextLink"] = f"{BASE}/{path}?skip={skip + 2}"
+            return httpx.Response(200, json=listed)
         page = int(req.url.params.get("page", "0"))
         if url in self.gone_links:
             return httpx.Response(410, json={"error": {"code": "syncStateNotFound"}})
@@ -360,3 +368,89 @@ def test_move_into_a_folder_newer_than_the_tree_heals_on_its_first_round(
     sync_folder(make_graph(FakeGraph([[item("m1", "NEW")]])), db, pool, "NEW")
     assert db.execute("SELECT folder_id, deleted_at FROM messages").fetchone()[:] == ("NEW", None)
     assert fake.value_calls["m1"] == 1
+
+
+def test_item_whose_value_and_lookup_both_404_is_a_tombstone(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """001-AC1: Deleted Items' delta lists non-mail items that /messages does not ($value and GET both
+    404); they never count as live messages, even when a fresh round lists them again."""
+    fake = FakeGraph([[item("m1"), item("p1")]])
+    fake.fail_value = {"p1": 404}
+    fake.messages = {"p1": 404}
+    graph = make_graph(fake)
+    with capture_logs() as logs:
+        assert sync_folder(graph, db, pool, FOLDER).deleted == 1
+    assert {"event": "item_gone", "folder_id": FOLDER, "log_level": "warning"} in logs
+    assert local_counts(db) == {FOLDER: 1}
+    row = db.execute("SELECT deleted_at, mime, mime_error FROM messages WHERE id='p1'").fetchone()
+    assert row["deleted_at"] is not None and row["mime"] is None and row["mime_error"] is None
+    with db:
+        db.execute("DELETE FROM sync_state")
+    sync_folder(graph, db, pool, FOLDER)
+    assert local_counts(db) == {FOLDER: 1}
+    assert fake.value_calls == Counter({"m1": 1, "p1": 2})
+
+
+def test_reconcile_catches_deletions_and_moves_delta_never_reported(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """001-AC5: delta never reports a soft delete out of Deleted Items; a local message the folder no
+    longer lists is tombstoned (404 or parked outside the visible tree) or moved, MIME kept, never
+    refetched; a server message not stored yet is only counted (the delta owns additions)."""
+    _visible_folders(db, FOLDER, "F2")
+    fake = FakeGraph([[item(m) for m in ("m1", "m2", "m3", "m4")]])
+    graph = make_graph(fake)
+    sync_folder(graph, db, pool, FOLDER)
+    fake.listing = {FOLDER: ["m1", "new"]}
+    fake.messages = {"m2": 404, "m3": "RECOVERABLE", "m4": "F2"}
+    c = mail.reconcile_folder(graph, db, FOLDER)
+    assert c.summary() == {"listed": 2, "moved": 1, "deleted": 2, "revived": 0, "unsynced": 1}
+    rows = {
+        r["id"]: (r["folder_id"], r["deleted_at"] is not None) for r in db.execute("SELECT * FROM messages")
+    }
+    assert rows == {"m1": (FOLDER, False), "m2": (FOLDER, True), "m3": (FOLDER, True), "m4": ("F2", False)}
+    assert db.execute("SELECT COUNT(*) FROM messages WHERE mime IS NULL").fetchone()[0] == 0
+    assert set(fake.value_calls.values()) == {1} and "new" not in fake.value_calls
+    assert not any("me/messages/m1?" in u for u in fake.urls)
+
+
+def test_reconcile_yields_after_each_page_and_each_chunk_of_lookups(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """001-AC4: each unit between two yields is one listing page or at most PAGE_SIZE lookups."""
+    monkeypatch.setattr(mail, "PAGE_SIZE", 2)
+    fake = FakeGraph([[item(m) for m in ("m1", "m2", "m3")]])
+    graph = make_graph(fake)
+    sync_folder(graph, db, pool, FOLDER)
+    fake.listing = {FOLDER: ["x1", "x2", "x3", "x4", "x5"]}
+    fake.messages = {"m1": 404, "m2": 404, "m3": 404}
+    base = len(fake.urls)
+    marks = [len(fake.urls) - base for _ in mail.reconcile_steps(graph, db, FOLDER, mail.Reconciled())]
+    assert marks == [1, 2, 3, 5]
+    assert len(fake.urls) - base == 6 and local_counts(db) == {}
+
+
+def test_reconcile_revives_a_tombstone_the_server_still_lists(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """001-AC5, 001-AC1: a false tombstone (a transient double 404) the server still lists in this
+    folder is live again and its MIME is fetched by the next round; one listed elsewhere, or stored
+    in another folder, stays as it is and is not counted as unsynced."""
+    fake = FakeGraph([[item("m1"), item("m2"), item("m3")]])
+    fake.fail_value = {"m2": 404, "m3": 404}
+    fake.messages = {"m2": 404, "m3": 404}
+    graph = make_graph(fake)
+    sync_folder(graph, db, pool, FOLDER)
+    sync_folder(make_graph(FakeGraph([[item("e1", "F2")]])), db, pool, "F2")
+    assert local_counts(db) == {FOLDER: 1, "F2": 1}
+    fake.fail_value, fake.pages = {}, [[]]
+    fake.listing = {FOLDER: ["m1", "m2", "m3", "e1"]}
+    fake.messages = {"m3": "F2"}
+    c = mail.reconcile_folder(graph, db, FOLDER)
+    assert (c.revived, c.unsynced, c.deleted) == (1, 0, 0)
+    gone = {r[0] for r in db.execute("SELECT id FROM messages WHERE deleted_at IS NOT NULL")}
+    assert gone == {"m3"}
+    sync_folder(graph, db, pool, FOLDER)
+    assert db.execute("SELECT mime IS NOT NULL FROM messages WHERE id='m2'").fetchone()[0] == 1
+    assert fake.value_calls["m2"] == 2 and fake.value_calls["m3"] == 1
