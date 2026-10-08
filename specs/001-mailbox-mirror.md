@@ -1,6 +1,6 @@
 # 001 — Local mailbox + calendar mirror (`minimail sync`, `search`, `agenda`, `mcp`)
 
-**Status**: in progress
+**Status**: shipped
 **Requested by**: babs
 **Date**: 2026-10-08
 
@@ -52,44 +52,44 @@ is lost locally.
 
 ## Acceptance criteria
 
-- [ ] **AC1** After `minimail sync` completes, every server folder and subfolder exists locally with its
+- [x] **AC1** After `minimail sync` completes, every server folder and subfolder exists locally with its
   full path, and per folder the local non-tombstoned count equals the folder's message count
   (`GET …/mailFolders/{id}/messages/$count`).
-- [ ] **AC2** Each stored MIME decompresses to bytes identical to `GET …/$value`; `minimail verify`
+- [x] **AC2** Each stored MIME decompresses to bytes identical to `GET …/$value`; `minimail verify`
   re-checks the recorded sha256 of every message and reports mismatches.
-- [ ] **AC3** A sync killed mid-backfill (`kill -INT`, `kill -9`) resumes without re-downloading
+- [x] **AC3** A sync killed mid-backfill (`kill -INT`, `kill -9`) resumes without re-downloading
   messages already stored and without duplicates.
-- [ ] **AC4** With `sync --live`, a mail arriving in Inbox is searchable locally within 60 s.
-- [ ] **AC5** A mail deleted on the server stays locally, marked deleted with the detection time; a
+- [x] **AC4** With `sync --live`, a mail arriving in Inbox is searchable locally within 60 s.
+- [x] **AC5** A mail deleted on the server stays locally, marked deleted with the detection time; a
   mail moved on the server shows its new folder locally; neither re-downloads the MIME.
-- [ ] **AC6** A read/flag/category change on the server updates local metadata without re-downloading
+- [x] **AC6** A read/flag/category change on the server updates local metadata without re-downloading
   the MIME.
-- [ ] **AC7** `minimail search` finds a word present in a body encoded as quoted-printable or base64, in
+- [x] **AC7** `minimail search` finds a word present in a body encoded as quoted-printable or base64, in
   ISO-8859-1 / windows-1252 / UTF-8, and in an RFC 2047 encoded subject; `ete` matches `été`.
-- [ ] **AC8** For an HTML-only mail, search matches visible text and not tag/attribute/style content.
-- [ ] **AC9** `minimail attachments <id> --out DIR` writes each attachment byte-identical to its MIME
+- [x] **AC8** For an HTML-only mail, search matches visible text and not tag/attribute/style content.
+- [x] **AC9** `minimail attachments <id> --out DIR` writes each attachment byte-identical to its MIME
   part, with the RFC 2231/2047 filename decoded and path-unsafe names sanitised (no write outside DIR).
-- [ ] **AC10** With no usable token, every command exits non-zero with a message pointing at
+- [x] **AC10** With no usable token, every command exits non-zero with a message pointing at
   `miniteams login`; `sync --live` logs it and retries next cycle instead of crashing or prompting.
-- [ ] **AC11** On 429/503 the client waits `Retry-After` and the sync continues without losing data.
-- [ ] **AC12** MCP tools `list_folders`, `search_mail`, `read_mail`, `get_attachments` answer from the
+- [x] **AC11** On 429/503 the client waits `Retry-After` and the sync continues without losing data.
+- [x] **AC12** MCP tools `list_folders`, `search_mail`, `read_mail`, `get_attachments` answer from the
   local archive; `read_mail` returns decoded headers + text, never the raw MIME blob.
-- [ ] **AC20** MCP tools `agenda`, `search_events`, `read_event` answer from the local archive;
+- [x] **AC20** MCP tools `agenda`, `search_events`, `read_event` answer from the local archive;
   `read_event` includes linked mail ids and the Teams meeting thread id when present.
-- [ ] **AC13** The archive directory is created `0700` and its files `0600`.
-- [ ] **AC14** After `minimail sync`, the default calendar's events from its earliest event to
+- [x] **AC13** The archive directory is created `0700` and its files `0600`.
+- [x] **AC14** After `minimail sync`, the default calendar's events from its earliest event to
   now + 2 years are stored: one row per series master, single event, exception and occurrence, the
   count matching a fresh `calendarView/delta` over the same window; masters, singles and exceptions
   hold the full `GET /me/events/{id}` JSON verbatim.
-- [ ] **AC15** `minimail agenda --from D1 --to D2` lists every non-cancelled event overlapping the
+- [x] **AC15** `minimail agenda --from D1 --to D2` lists every non-cancelled event overlapping the
   period, occurrences expanded, in local time, with organizer, location and Teams join flag.
-- [ ] **AC16** With `sync --live`, a created / moved / cancelled / deleted event is reflected locally
+- [x] **AC16** With `sync --live`, a created / moved / cancelled / deleted event is reflected locally
   within 60 s; a deleted event becomes a tombstone, a cancelled one stays flagged `isCancelled`.
-- [ ] **AC17** When the sliding window advances (checked daily), events entering the future edge are
+- [x] **AC17** When the sliding window advances (checked daily), events entering the future edge are
   fetched without re-running the full backfill.
-- [ ] **AC18** `minimail search --events` matches subject, body, location and attendee names/addresses,
+- [x] **AC18** `minimail search --events` matches subject, body, location and attendee names/addresses,
   accent-insensitive.
-- [ ] **AC19** `minimail event <id>` shows the invitation/response mails sharing its `iCalUId` and,
+- [x] **AC19** `minimail event <id>` shows the invitation/response mails sharing its `iCalUId` and,
   for a Teams meeting, the `19:meeting_…@thread.v2` id decoded from `joinUrl`.
 
 ## Phases
