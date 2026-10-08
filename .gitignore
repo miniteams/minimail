@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+
+# local archive (personal mail/calendar data — never commit)
+# `data` is often a symlink to a NAS/large disk, so match the bare name too, not just `data/`.
+/data
+data/
+.scratchpad/
+.claude/scratchpad/
+
+# MCP registration for local runs (per machine)
+/.mcp.json
