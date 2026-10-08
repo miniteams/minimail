@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     msal_cache: Path = Field(default_factory=_default_msal_cache)
     graph_url: str = "https://graph.microsoft.com/v1.0"
     data_dir: Path = Path("data")
+    # Security: the only place MCP `get_attachments` writes to; unset = `<data_dir>/exports`.
+    export_dir: Path | None = None
     log_level: str = "INFO"
     # `sync --live` cadences, in seconds.
     inbox_every: float = Field(default=30.0, gt=0)
@@ -40,6 +42,10 @@ class Settings(BaseSettings):
     @property
     def authority(self) -> str:
         return f"https://login.microsoftonline.com/{self.tenant_id}"
+
+    @property
+    def exports(self) -> Path:
+        return self.export_dir or self.data_dir / "exports"
 
     @property
     def db_path(self) -> Path:

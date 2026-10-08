@@ -538,13 +538,13 @@ def test_attachments_into_an_unwritable_dir_exit_1(env: Path, capsys: pytest.Cap
     ],
 )
 def test_safe_filename(name: str, safe: str) -> None:
-    assert cli.safe_filename(name, "application/octet-stream", 3) == safe
+    assert mime.safe_filename(name, "application/octet-stream", 3) == safe
 
 
 def test_long_names_fit_the_filesystem() -> None:
-    name = cli.safe_filename("é" * 300 + ".pdf", "application/pdf", 1)
+    name = mime.safe_filename("é" * 300 + ".pdf", "application/pdf", 1)
     assert name.endswith(".pdf") and len(name.encode()) <= 200
-    assert len(cli.safe_filename("a." + "x" * 300, "", 1).encode()) <= 200
+    assert len(mime.safe_filename("a." + "x" * 300, "", 1).encode()) <= 200
 
 
 # --- hostile text, forwarded mails, read-only commands, failed writes -----------------------------

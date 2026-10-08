@@ -165,6 +165,9 @@ is lost locally.
 ### Phase 6 — MCP stdio
 - Work: `minimail mcp` with mail tools (`list_folders`, `search_mail`, `read_mail`, `get_attachments`)
   and calendar tools (`agenda`, `search_events`, `read_event`), same shape as miniteams' MCP.
+  Hand-written stdio JSON-RPC (no SDK), archive opened read-only per call; results carry
+  `mail_synced_at` / `calendar_synced_at` (max `sync_state.updated_at`); `show`/`event` logic shared
+  with the CLI (`search.message_view`, `calendar.view`); `MINIMAIL_EXPORT_DIR` for extraction.
 - **Covers**: AC12, AC20
 - **Data model impact**: none
 - **DoD**: MCP tool tests green; registered in Claude, a mail search and a "this week" agenda return
@@ -310,3 +313,15 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
 - **Throttling is per mailbox**: a 429/503/504 pushes back the next request slot of every thread, and
   `Retry-After` is capped at 60 s. On SIGTERM/SIGINT the client is closed before the download pool
   is drained: closing wakes every thread asleep in a back-off or a pacing slot.
+- **MCP extraction is confined to `MINIMAIL_EXPORT_DIR/<short id>/`** (default `<data dir>/exports`,
+  inside the owner-only archive directory): the client names no path, attachment names go through
+  `safe_filename`; the root and the message's directory are opened `O_NOFOLLOW` and written through
+  their fds (no check-then-open race), the root must be the user's and not group/other-writable, and
+  a file already holding the same bytes is reused (a repeating agent cannot fill the archive volume). The archive is opened per call,
+  so a missing or not-yet-migrated archive is a tool error and the server never migrates it.
+- **MCP results are bounded**: bodies paged (50 000 characters, `offset`/`next_offset`), every list
+  cut at 100 items with a `<name>_total`, strings at 2 000 characters (200 inside lists; ids and
+  folder paths never), `agenda` at most 92 days, so one wide message (thousands of recipients or
+  attachments) cannot flood the agent. Caps count characters before JSON encoding (escaping can lengthen
+  the encoded result). The server instructions flag mail and event text as
+  third-party data, never instructions.

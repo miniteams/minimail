@@ -29,6 +29,7 @@ Sign-in is miniteams' (`miniteams login`): minimail only reads tokens from its M
 | `uv run minimail event ID [--json]` | An event's subject, times, type, organizer, location, attendees, cancelled/deleted state, Teams meeting chat id (`19:meeting_…@thread.v2`, decoded from the join URL), iCalUId, the mails carrying it (invitations, responses: short id, date, subject), then its body. An occurrence shows its series' details. `ID`: full id, or a unique prefix of it or of the short id |
 | `uv run minimail show ID [--raw]` | Decoded headers, folder, read/flag/categories, attachment list and text body, control characters shown as `�`; `--raw` writes the verbatim MIME to stdout. `ID`: full id, or a unique prefix of it or of the short id |
 | `uv run minimail attachments ID --out DIR` | Write every attachment into `DIR`, decoded, files `0600`; a forwarded mail is written verbatim as `.eml`, followed by its own attachments (opened 3 forwards deep; deeper ones are written, not opened). On a write error the partial file is removed and the files already written are listed. Names are sanitised (no path, no control character, no leading dot); unnamed parts become `part-N.<ext>`; a name already taken gets `-1`, `-2`… — nothing is overwritten, nothing lands outside `DIR` |
+| `uv run minimail mcp` | MCP server over stdio for Claude (see [MCP](#mcp)) |
 
 ## Configuration (`MINIMAIL_*`, env or `.env`)
 
@@ -37,6 +38,7 @@ Sign-in is miniteams' (`miniteams login`): minimail only reads tokens from its M
 | `MINIMAIL_TENANT_ID` | — (required) | Entra tenant id |
 | `MINIMAIL_DATA_DIR` | `data` | Archive directory (`mail.db`); often a symlink to larger storage |
 | `MINIMAIL_MSAL_CACHE` | `~/.config/miniteams/msal_cache.json` | Token cache shared with miniteams |
+| `MINIMAIL_EXPORT_DIR` | `<MINIMAIL_DATA_DIR>/exports` | The only place MCP `get_attachments` writes to (one `<short id>/` directory per message); created `0700`, refused if a symlink, not yours or group/other-writable |
 | `MINIMAIL_LOG_LEVEL` | `INFO` | Logs go to stderr (JSON when not a TTY) |
 | `MINIMAIL_INBOX_EVERY` | `30` | `sync --live`: seconds between Inbox (then calendar) rounds, and the retry delay after a failed cycle |
 | `MINIMAIL_FOLDERS_EVERY` | `300` | `sync --live`: seconds between rounds of the other folders |
@@ -57,3 +59,35 @@ writer; otherwise either side may fail with `database is locked`; rerun it). Unt
 the stored MIME, the calendar UID of meeting mails already archived (what links them to their event).
 
 The archive is personal data: its directory is `0700`, its files `0600`. Never commit `data/`.
+
+## MCP
+
+`minimail mcp` serves the archive to an MCP client over stdin/stdout (newline-delimited JSON-RPC,
+same shape as miniteams'). Read-only on the archive, no network, no Graph call; logs on stderr.
+
+| Tool | Returns |
+|---|---|
+| `list_folders` | Folder paths, server and local message counts |
+| `search_mail` | `query` (words ANDed, accents ignored), optional `folder` path, `limit` (≤ 100, default 20), `include_deleted`; newest first, with `short_id` and a snippet |
+| `read_mail` | `id` (full or short id prefix): decoded headers, folder, read/flag/categories, attachment list, text body (50 000 characters per call, `offset` / `next_offset` for the rest). Never the raw MIME |
+| `get_attachments` | `id`: the attachment list; with `extract` (optionally one `index`), writes them under `MINIMAIL_EXPORT_DIR/<short id>/` (same naming rules as `attachments`; a file already there with the same bytes is reused, not copied again) and returns the paths. The client cannot choose the directory. The root must be yours, not group/other-writable and not itself a symlink; a symlink at the message's directory is refused |
+| `agenda` | `from` / `to` (`YYYY-MM-DD`, default today to +7, at most 92 days): events as `agenda --json` |
+| `search_events` | `query`, `limit`, `include_deleted`: as `search --events` |
+| `read_event` | `id`: as `event --json` (linked mail ids, Teams `meeting_thread_id` for miniteams) plus the body, paged like `read_mail` |
+
+Results are bounded: lists cut at 100 items (`<name>_total` gives the full count), strings at
+2 000 characters (200 inside a list, e.g. recipients or file names; ids and folder paths are never
+cut), bodies paged at 50 000 characters. The caps count characters before JSON encoding: escaped
+quotes or control characters make the encoded result longer. Mail and event text is third-party content (the server instructions
+say so). Every result carries `source: "archive"`, `mail_synced_at` and `calendar_synced_at` (last progress
+saved by `sync`, UTC): an old value means the sync stopped. A missing archive, or one that needs
+`minimail reindex`, is a tool error; the server stays up and picks the archive up once it is ready.
+
+Register with Claude Code (`MINIMAIL_TENANT_ID` comes from the repo's `.env`, so run from the repo):
+
+```sh
+claude mcp add minimail -- uv run --directory /path/to/minimail minimail mcp
+```
+
+or a gitignored `.mcp.json` at the repo root:
+`{"mcpServers": {"minimail": {"command": "uv", "args": ["run", "minimail", "mcp"]}}}`.

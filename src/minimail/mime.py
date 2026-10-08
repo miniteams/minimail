@@ -6,10 +6,16 @@ still be archived and searchable on whatever could be read.
 
 import email
 import email.policy
+import mimetypes
+import os
 import re
+import stat
+from collections.abc import Iterator, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from email.message import EmailMessage, Message
 from html.parser import HTMLParser
+from pathlib import Path
 
 # ponytail: hard cap per message; a multi-MB text body adds nothing a search can use.
 MAX_TEXT = 1_000_000
@@ -219,3 +225,66 @@ def extract(raw: bytes) -> Extracted:
         attachments=attachments,
         ical_uid=ical_uid,
     )
+
+
+# Bytes, not characters: NAME_MAX is 255 bytes and a UTF-8 character takes up to 4.
+_MAX_NAME = 200
+
+
+def safe_filename(name: str, content_type: str, index: int) -> str:
+    """A plain file name: no path separator, control character or leading dot (no `..`, no hidden
+    file); unnamed parts are named after their position and content type."""
+    name = "".join("_" if c in "/\\" else c for c in name if c.isprintable()).strip().lstrip(".").strip()
+    if not name:
+        name = f"part-{index}{mimetypes.guess_extension(content_type) or '.bin'}"
+    stem, ext = os.path.splitext(name)
+    if len(ext.encode()) > 16:
+        stem, ext = name, ""
+    return stem.encode()[: _MAX_NAME - len(ext.encode())].decode(errors="ignore") + ext
+
+
+def _same_file(name: str, dir_fd: int, data: bytes) -> bool:
+    # O_NONBLOCK: a planted FIFO must not hang the reader.
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != len(data):
+            return False
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read() == data
+    finally:
+        os.close(fd)
+
+
+def save_attachments(
+    found: Sequence[Attachment], dir_fd: int, out: Path, *, reuse: bool = False
+) -> Iterator[Path]:
+    """Write each attachment into the directory open at `dir_fd` (shown as `out`), owner-only, never
+    overwriting: a taken name gets `-N`; with `reuse`, a taken name already holding the same bytes is
+    yielded instead. Yields each path once written; a failed write leaves no partial file behind."""
+    # Security: names are opened relative to the directory fd, so a swapped path cannot redirect them.
+    for index, att in enumerate(found, 1):
+        stem, ext = os.path.splitext(safe_filename(att.filename, att.content_type, index))
+        for n in range(1000):
+            name = f"{stem}-{n}{ext}" if n else f"{stem}{ext}"
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+            except FileExistsError:
+                if reuse and _same_file(name, dir_fd, att.data):
+                    yield out / name
+                    break
+                continue
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(att.data)
+            except BaseException:  # Ctrl-C / SIGTERM mid-write too
+                with suppress(OSError):
+                    os.unlink(name, dir_fd=dir_fd)
+                raise
+            yield out / name
+            break
+        else:
+            raise FileExistsError(f"no free name for {stem}{ext} in {out}")

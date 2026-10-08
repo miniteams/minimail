@@ -3,17 +3,16 @@
 import argparse
 import hashlib
 import json
-import mimetypes
 import os
 import signal
 import sqlite3
 import sys
 import unicodedata
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from compression import zstd
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, suppress
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,14 +30,14 @@ from .logging import setup_logging
 from .mail import (
     DOWNLOAD_WORKERS,
     Reconciled,
-    _address,
     local_counts,
     path_id,
     reconcile_folder,
     retry_failed,
 )
-from .mime import Attachment, attachments, body_text, extract, header, html_to_text, parse
-from .search import resolve, search, short_id
+from .mcp import Server
+from .mime import attachments, extract, save_attachments
+from .search import MimeMissing, message_view, resolve, search, short_id, stored_mime
 from .store import needs_migration, open_db, open_readonly, rebuild_fts
 
 log = structlog.get_logger()
@@ -223,10 +222,6 @@ def cmd_reindex(settings: Settings, db: sqlite3.Connection, args: argparse.Names
     return 0
 
 
-def _local(stamp: str | None) -> str:
-    return datetime.fromisoformat(stamp).astimezone().strftime("%a %Y-%m-%d %H:%M") if stamp else "?"
-
-
 def _search_events(db: sqlite3.Connection, args: argparse.Namespace) -> int:
     if args.folder:
         print("minimail: --folder does not apply to --events", file=sys.stderr)
@@ -237,7 +232,7 @@ def _search_events(db: sqlite3.Connection, args: argparse.Namespace) -> int:
             print(json.dumps(hit))  # ASCII: C1 controls and bidi overrides leave \u-escaped
             continue
         gone = "  (deleted)" if row["deleted_at"] else ""
-        _say(f"{hit['short_id']}  {_local(row['start_utc'])}  {_one_line(row['subject'])}{gone}")
+        _say(f"{hit['short_id']}  {calendar.local(row['start_utc'])}  {_one_line(row['subject'])}{gone}")
         _say(f"    {hit['snippet']}")
     return 0
 
@@ -263,21 +258,13 @@ def cmd_search(settings: Settings, db: sqlite3.Connection, args: argparse.Namesp
 def _stored_mime(db: sqlite3.Connection, ref: str) -> tuple[sqlite3.Row, bytes] | int:
     """The message row and its verbatim MIME, or the exit code after telling the user why not."""
     try:
-        msg_id = resolve(db, ref)
+        return stored_mime(db, ref)
     except LookupError as exc:
         print(f"minimail: {exc.args[0]}", file=sys.stderr)
         return 2
-    row = db.execute(
-        "SELECT m.*, f.path AS folder FROM messages m LEFT JOIN folders f ON f.id = m.folder_id WHERE m.id=?",
-        (msg_id,),
-    ).fetchone()
-    if row["mime"] is None:
-        print(
-            f"minimail: no MIME stored for {short_id(msg_id)} ({row['mime_error'] or 'not fetched yet'})",
-            file=sys.stderr,
-        )
+    except MimeMissing as exc:
+        print(f"minimail: {exc}", file=sys.stderr)
         return 1
-    return row, zstd.decompress(row["mime"])
 
 
 def cmd_show(settings: Settings, db: sqlite3.Connection, args: argparse.Namespace) -> int:
@@ -291,58 +278,25 @@ def cmd_show(settings: Settings, db: sqlite3.Connection, args: argparse.Namespac
         sys.stdout.buffer.flush()
         return 0
     try:
-        msg = parse(raw)
-        body = body_text(msg)
-        found_attachments = attachments(raw)
+        shown = message_view(row, raw)
     except RecursionError:
         print("minimail: message too deeply nested to display (use --raw)", file=sys.stderr)
         return 1
-    meta = json.loads(row["meta"])
-    for name in ("From", "To", "Cc", "Date", "Subject"):
-        if value := header(msg, name):
-            _say(f"{name}: {value}")
-    _say(f"Folder: {_one_line(row['folder'])}")
-    flag = (meta.get("flag") or {}).get("flagStatus", "notFlagged")
-    _say(f"Read: {'yes' if meta.get('isRead') else 'no'}  Flag: {_one_line(flag)}")
-    if categories := meta.get("categories"):
-        _say(f"Categories: {', '.join(map(_one_line, categories))}")
-    if row["deleted_at"]:
-        _say(f"Deleted: {_one_line(row['deleted_at'])}")
-    _say(f"Id: {_one_line(row['id'])}")
-    for att in found_attachments:
-        name = _one_line(att.filename) or "(no name)"
-        _say(f"Attachment: {name} ({_one_line(att.content_type)}, {len(att.data)} bytes)")
+    for name, value in shown["headers"].items():
+        _say(f"{name}: {value}")
+    _say(f"Folder: {_one_line(shown['folder'])}")
+    _say(f"Read: {'yes' if shown['read'] else 'no'}  Flag: {_one_line(shown['flag'])}")
+    if shown["categories"]:
+        _say(f"Categories: {', '.join(map(_one_line, shown['categories']))}")
+    if shown["deleted_at"]:
+        _say(f"Deleted: {_one_line(shown['deleted_at'])}")
+    _say(f"Id: {_one_line(shown['id'])}")
+    for att in shown["attachments"]:
+        name = _one_line(att["filename"]) or "(no name)"
+        _say(f"Attachment: {name} ({_one_line(att['content_type'])}, {att['size']} bytes)")
     print()
-    _say(body)
+    _say(shown["body"])
     return 0
-
-
-def _span(row: sqlite3.Row, data: dict[str, Any]) -> tuple[str, str]:
-    """Start and end as shown; an all-day event's are its first and last days, never shifted."""
-    if not data.get("isAllDay") or not row["start_utc"] or not row["end_utc"]:
-        return _local(row["start_utc"]), _local(row["end_utc"])
-    first = date.fromisoformat(row["start_utc"][:10])
-    last = max(first, date.fromisoformat(row["end_utc"][:10]) - timedelta(1))
-    return first.strftime("%a %Y-%m-%d"), last.strftime("%a %Y-%m-%d")
-
-
-def _summary(row: sqlite3.Row, data: dict[str, Any]) -> dict[str, Any]:
-    thread = calendar.meeting_thread_id(data)
-    start, end = _span(row, data)
-    return {
-        "id": row["id"],
-        "short_id": short_id(row["id"]),
-        "type": row["type"],
-        "all_day": bool(data.get("isAllDay")),
-        "start": start,
-        "end": end,
-        "subject": data.get("subject") or "",
-        "organizer": _address(data.get("organizer")),
-        "location": (data.get("location") or {}).get("displayName") or "",
-        # The new short Teams links (`/meet/…`) carry no thread id, hence the provider too.
-        "teams": thread is not None or data.get("onlineMeetingProvider") == "teamsForBusiness",
-        "meeting_thread_id": thread,
-    }
 
 
 def _when(hit: dict[str, Any]) -> str:
@@ -355,7 +309,7 @@ def _when(hit: dict[str, Any]) -> str:
 def cmd_agenda(settings: Settings, db: sqlite3.Connection, args: argparse.Namespace) -> int:
     first = args.since or date.today()
     for row, data in calendar.agenda(db, first, args.until or first + timedelta(days=7)):
-        hit = _summary(row, data)
+        hit = calendar.summary(row, data)
         if args.json:
             print(json.dumps(hit))
             continue
@@ -374,17 +328,7 @@ def cmd_event(settings: Settings, db: sqlite3.Connection, args: argparse.Namespa
     except LookupError as exc:
         print(f"minimail: {exc.args[0]}", file=sys.stderr)
         return 2
-    row = calendar.event(db, event_id)
-    data = calendar.details(row)
-    found = {
-        **_summary(row, data),
-        # The column, not the JSON: a refused GET leaves the JSON older than the delta item's state.
-        "cancelled": bool(row["is_cancelled"]),
-        "deleted_at": row["deleted_at"],
-        "ical_uid": data.get("iCalUId"),
-        "attendees": [_address(a) for a in data.get("attendees") or []],
-        "mails": [{**dict(m), "short_id": short_id(m["id"])} for m in calendar.linked_mails(db, data)],
-    }
+    found, body = calendar.view(db, event_id)
     if args.json:
         print(json.dumps(found))
         return 0
@@ -406,61 +350,10 @@ def cmd_event(settings: Settings, db: sqlite3.Connection, args: argparse.Namespa
     for mail in found["mails"]:
         who = "  ".join(_one_line(mail[k] or "") for k in ("received_at", "subject"))
         _say(f"Mail: {mail['short_id']}  {who}{'  (deleted)' if mail['deleted_at'] else ''}")
-    _say(f"Id: {_one_line(row['id'])}")
-    body = data.get("body") or {}
-    text = body.get("content") or ""
+    _say(f"Id: {_one_line(found['id'])}")
     print()
-    _say(html_to_text(text) if (body.get("contentType") or "").lower() == "html" else text)
+    _say(body)
     return 0
-
-
-# Bytes, not characters: NAME_MAX is 255 bytes and a UTF-8 character takes up to 4.
-_MAX_NAME = 200
-
-
-def safe_filename(name: str, content_type: str, index: int) -> str:
-    """A plain file name: no path separator, control character or leading dot (no `..`, no hidden
-    file); unnamed parts are named after their position and content type."""
-    name = "".join("_" if c in "/\\" else c for c in name if c.isprintable()).strip().lstrip(".").strip()
-    if not name:
-        name = f"part-{index}{mimetypes.guess_extension(content_type) or '.bin'}"
-    stem, ext = os.path.splitext(name)
-    if len(ext.encode()) > 16:
-        stem, ext = name, ""
-    return stem.encode()[: _MAX_NAME - len(ext.encode())].decode(errors="ignore") + ext
-
-
-def save_attachments(found: Sequence[Attachment], out: Path) -> Iterator[Path]:
-    """Write each attachment into `out`, owner-only, never overwriting: a taken name gets `-N`.
-    Yields each path once written; a failed write leaves no partial file behind."""
-    out.mkdir(parents=True, exist_ok=True)
-    out = out.resolve()
-    # Security: names are opened relative to the directory fd, so a swapped path cannot redirect them.
-    dir_fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        for index, att in enumerate(found, 1):
-            stem, ext = os.path.splitext(safe_filename(att.filename, att.content_type, index))
-            for n in range(1000):
-                name = f"{stem}-{n}{ext}" if n else f"{stem}{ext}"
-                try:
-                    fd = os.open(
-                        name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd
-                    )
-                except FileExistsError:
-                    continue
-                try:
-                    with os.fdopen(fd, "wb") as f:
-                        f.write(att.data)
-                except BaseException:  # Ctrl-C / SIGTERM mid-write too
-                    with suppress(OSError):
-                        os.unlink(name, dir_fd=dir_fd)
-                    raise
-                yield out / name
-                break
-            else:
-                raise FileExistsError(f"no free name for {stem}{ext} in {out}")
-    finally:
-        os.close(dir_fd)
 
 
 def cmd_attachments(settings: Settings, db: sqlite3.Connection, args: argparse.Namespace) -> int:
@@ -473,8 +366,14 @@ def cmd_attachments(settings: Settings, db: sqlite3.Connection, args: argparse.N
         print("minimail: message too deeply nested to extract (use show --raw)", file=sys.stderr)
         return 1
     try:
-        for path in save_attachments(found_attachments, args.out):
-            print(path, flush=True)
+        args.out.mkdir(parents=True, exist_ok=True)
+        out = args.out.resolve()
+        dir_fd = os.open(out, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for path in save_attachments(found_attachments, dir_fd, out):
+                print(path, flush=True)
+        finally:
+            os.close(dir_fd)
     except OSError as exc:
         print(
             f"minimail: cannot write attachments: {exc} (the files listed above were written)",
@@ -530,6 +429,7 @@ def _parser() -> argparse.ArgumentParser:
     att = sub.add_parser("attachments", help="extract a message's attachments")
     att.add_argument("id", help="message id, or a unique prefix of it or of its short id")
     att.add_argument("--out", type=Path, required=True, metavar="DIR", help="directory to write into")
+    sub.add_parser("mcp", help="MCP server over stdio for Claude (read-only on the archive, no network)")
     return parser
 
 
@@ -567,6 +467,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     setup_logging(settings.log_level)
     log.info("startup", version=__version__, command=args.command)
+    if args.command == "mcp":
+        # The server opens the archive per call: a missing or old one is a tool error, not a dead server.
+        with suppress(KeyboardInterrupt):
+            return Server(settings).serve()
+        return 130
     reader = args.command in READERS
     if reader and not settings.db_path.exists():
         print(f"minimail: no archive at {settings.db_path} (check MINIMAIL_DATA_DIR)", file=sys.stderr)

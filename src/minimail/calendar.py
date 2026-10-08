@@ -21,7 +21,7 @@ import structlog
 from .graph import Graph
 from .mail import PERMANENT, Counters, _address, _needs_resync, _now, path_id
 from .mime import MAX_TEXT, html_to_text
-from .search import fts_query
+from .search import fts_query, short_id
 
 log = structlog.get_logger()
 
@@ -298,3 +298,53 @@ def search_events(
            ORDER BY e.start_utc DESC LIMIT ?""",
         (fts_query(text), deleted, limit),
     ).fetchall()
+
+
+def local(stamp: str | None) -> str:
+    return datetime.fromisoformat(stamp).astimezone().strftime("%a %Y-%m-%d %H:%M") if stamp else "?"
+
+
+def _span(row: sqlite3.Row, data: dict[str, Any]) -> tuple[str, str]:
+    """Start and end as shown; an all-day event's are its first and last days, never shifted."""
+    if not data.get("isAllDay") or not row["start_utc"] or not row["end_utc"]:
+        return local(row["start_utc"]), local(row["end_utc"])
+    first = date.fromisoformat(row["start_utc"][:10])
+    last = max(first, date.fromisoformat(row["end_utc"][:10]) - timedelta(1))
+    return first.strftime("%a %Y-%m-%d"), last.strftime("%a %Y-%m-%d")
+
+
+def summary(row: sqlite3.Row, data: dict[str, Any]) -> dict[str, Any]:
+    thread = meeting_thread_id(data)
+    start, end = _span(row, data)
+    return {
+        "id": row["id"],
+        "short_id": short_id(row["id"]),
+        "type": row["type"],
+        "all_day": bool(data.get("isAllDay")),
+        "start": start,
+        "end": end,
+        "subject": data.get("subject") or "",
+        "organizer": _address(data.get("organizer")),
+        "location": (data.get("location") or {}).get("displayName") or "",
+        # The new short Teams links (`/meet/…`) carry no thread id, hence the provider too.
+        "teams": thread is not None or data.get("onlineMeetingProvider") == "teamsForBusiness",
+        "meeting_thread_id": thread,
+    }
+
+
+def view(db: sqlite3.Connection, event_id: str) -> tuple[dict[str, Any], str]:
+    """An event's summary, state, attendees and linked mails; and its body as text."""
+    row = event(db, event_id)
+    data = details(row)
+    found = {
+        **summary(row, data),
+        # The column, not the JSON: a refused GET leaves the JSON older than the delta item's state.
+        "cancelled": bool(row["is_cancelled"]),
+        "deleted_at": row["deleted_at"],
+        "ical_uid": data.get("iCalUId"),
+        "attendees": [_address(a) for a in data.get("attendees") or []],
+        "mails": [{**dict(m), "short_id": short_id(m["id"])} for m in linked_mails(db, data)],
+    }
+    body = data.get("body") or {}
+    text = body.get("content") or ""
+    return found, html_to_text(text) if (body.get("contentType") or "").lower() == "html" else text
