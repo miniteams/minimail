@@ -1,0 +1,324 @@
+"""MIME → decoded, searchable fields. The raw bytes are never altered; this only reads them.
+
+Every decoding step degrades instead of failing: a mail with a bogus charset or a broken part must
+still be archived and searchable on whatever could be read.
+"""
+
+import email
+import email.policy
+import mimetypes
+import os
+import re
+import stat
+import threading
+from collections.abc import Iterator, Sequence
+from contextlib import suppress
+from dataclasses import dataclass, field
+from email.message import EmailMessage, Message
+from html.parser import HTMLParser
+from pathlib import Path
+
+# ponytail: hard cap per message; a multi-MB text body adds nothing a search can use.
+MAX_TEXT = 1_000_000
+# Parsing holds ~5x the raw size: above this, one parse at a time across download workers.
+BIG_MIME = 20_000_000
+_BIG_GATE = threading.Lock()
+
+# No `head`: without a `</head>` it would hide the whole body; its text lives in title/style/script.
+_SKIP_TAGS = frozenset({"script", "style", "title", "noscript", "template"})
+_BLOCK_TAGS = frozenset(
+    {
+        "p", "div", "br", "hr", "tr", "td", "th", "li", "ul", "ol", "dl", "dt", "dd",
+        "h1", "h2", "h3", "h4", "h5", "h6", "table", "thead", "tbody", "tfoot", "caption",
+        "blockquote", "pre", "section", "article", "header", "footer", "nav", "aside", "main",
+        "address", "figure", "figcaption", "form", "fieldset", "center",
+    }
+)  # fmt: skip
+
+
+class _HTMLText(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _SKIP_TAGS:
+            self._skip += 1
+        elif tag in _BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _SKIP_TAGS and self._skip:
+            self._skip -= 1
+        elif tag in _BLOCK_TAGS:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip:
+            self.parts.append(data)
+
+
+def html_to_text(html: str) -> str:
+    """Visible text only: tags, attributes, styles and scripts are dropped."""
+    parser = _HTMLText()
+    try:
+        parser.feed(html)
+        parser.close()
+    except AssertionError:  # pragma: no cover — html.parser's last-resort on pathological markup
+        pass
+    # Inline tags split no word ("Bon<b>jour</b>"): only block tags add a separator.
+    return " ".join("".join(parser.parts).split())
+
+
+def parse(raw: bytes) -> EmailMessage:
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    assert isinstance(msg, EmailMessage)  # guaranteed by policy.default
+    return msg
+
+
+def part_text(part: Message) -> str:
+    """Decoded text of a leaf part: transfer encoding and charset handled, unknown charsets read
+    as latin-1 (lossless byte → char) rather than dropped."""
+    try:
+        content = part.get_content()  # type: ignore[attr-defined]
+        # U+FFFD: 8-bit text under a missing or wrong charset (common) — re-read the bytes below.
+        if isinstance(content, str) and "\ufffd" not in content:
+            return content
+    except LookupError, UnicodeError, ValueError, AttributeError:
+        pass
+    payload = part.get_payload(decode=True)
+    if not isinstance(payload, bytes):
+        return ""
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return payload.decode("latin-1")
+
+
+def header(msg: Message, name: str) -> str:
+    try:
+        value = msg.get(name)
+    except Exception:  # noqa: BLE001 — a malformed header must not lose the message
+        return ""
+    return " ".join(str(value).split()) if value is not None else ""
+
+
+@dataclass
+class Extracted:
+    subject: str = ""
+    sender: str = ""
+    recipients: str = ""
+    text: str = ""
+    attachments: list[str] = field(default_factory=list)
+    ical_uid: str | None = None
+    error: str | None = None  # set when parsing failed: the caller logs it with the message's id
+
+
+def body_text(msg: EmailMessage) -> str:
+    """The message's own text body (plain preferred, else HTML reduced to its visible text)."""
+    body = msg.get_body(preferencelist=("plain", "html"))
+    return "" if body is None else _as_text(body)
+
+
+def _as_text(part: Message) -> str:
+    text = part_text(part)
+    return html_to_text(text) if part.get_content_type() == "text/html" else text
+
+
+@dataclass
+class Attachment:
+    filename: str  # decoded (RFC 2231/2047), unsanitised; "" when the part has none
+    content_type: str
+    data: bytes  # the part's payload after transfer decoding, byte for byte
+
+
+class _ForwardedAsLeaf(EmailMessage):
+    """Reports `message/rfc822` as a non-`message` type, so the parser keeps a forwarded mail as a
+    leaf whose payload is the verbatim bytes the outer MIME carries instead of re-splitting it."""
+
+    def get_content_maintype(self) -> str:
+        return (
+            "application" if self.get_content_type() == "message/rfc822" else super().get_content_maintype()
+        )
+
+
+_FORWARDED_AS_LEAF = email.policy.default.clone(message_factory=_ForwardedAsLeaf)
+
+
+def attachments(raw: bytes, depth: int = 0) -> list[Attachment]:
+    """Every attachment: a leaf part with a filename or an attachment disposition, or any non-text
+    leaf (e.g. an inline image). A forwarded mail is one (`.eml`), followed by its own attachments
+    while `depth` < 3 (deeper forwards are still listed, not opened)."""
+    found: list[Attachment] = []
+    for part in email.message_from_bytes(raw, policy=_FORWARDED_AS_LEAF).walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename() or ""
+        body_like = part.get_content_maintype() in {"text", "message"}
+        if not filename and body_like and part.get_content_disposition() != "attachment":
+            continue
+        payload = part.get_payload(decode=True)
+        data = payload if isinstance(payload, bytes) else b""
+        if part.get_content_type() != "message/rfc822":
+            found.append(Attachment(filename, part.get_content_type(), data))
+            continue
+        if filename and not filename.lower().endswith(".eml"):
+            filename += ".eml"
+        found.append(Attachment(filename, "message/rfc822", data))
+        # Security: each level copies its nested bytes; unbounded = quadratic memory, RecursionError.
+        if depth < 3:
+            found.extend(attachments(data, depth + 1))
+    return found
+
+
+def _body_text(msg: EmailMessage, out: list[str], attachments: list[str], depth: int) -> None:
+    body = msg.get_body(preferencelist=("plain", "html"))
+    out.append("" if body is None else _as_text(body))
+    if msg.get_content_type() == "multipart/mixed":
+        # Text, inline image, text: the parts after the first are body text too.
+        for extra in msg.iter_parts():
+            if (
+                extra is not body
+                and extra.get_content_type() in {"text/plain", "text/html"}
+                and extra.get_content_disposition() != "attachment"
+            ):
+                out.append(_as_text(extra))
+    for part in _leaves(msg):
+        if part.get_content_type() == "message/rfc822":
+            # Forwarded mail as attachment: its own headers and body are searchable too.
+            inner = part.get_payload(0) if part.is_multipart() else None
+            if isinstance(inner, EmailMessage) and depth < 3:
+                out.append(header(inner, "subject"))
+                out.append(header(inner, "from"))
+                _body_text(inner, out, attachments, depth + 1)
+            continue
+        filename = part.get_filename()
+        if filename and part.get_content_disposition() in {"attachment", "inline"}:
+            attachments.append(filename)
+
+
+def _leaves(msg: Message) -> list[Message]:
+    """Leaf parts of this message, stopping at embedded messages (walk() would descend into them
+    and count a forwarded mail's attachments twice)."""
+    if not msg.is_multipart():
+        return [msg]  # single-part mail: the part is the message (possibly a bare attachment)
+    leaves: list[Message] = []
+    for part in msg.get_payload():
+        if not isinstance(part, Message):
+            continue
+        if part.is_multipart() and part.get_content_type() != "message/rfc822":
+            leaves.extend(_leaves(part))
+        else:
+            leaves.append(part)
+    return leaves
+
+
+# RFC 5545 §3.1: a line break followed by one space or tab continues the previous line.
+_FOLD = re.compile(r"\r?\n[ \t]")
+_UID = re.compile(r"^UID(?:;[^:\r\n]*)?:(.+?)\r?$", re.MULTILINE | re.IGNORECASE)
+
+
+def calendar_uid(msg: Message) -> str | None:
+    """UID of the message's own text/calendar part (meeting invitations and responses)."""
+    for part in _leaves(msg):
+        if part.get_content_type() == "text/calendar":
+            if found := _UID.search(_FOLD.sub("", part_text(part))):
+                return found.group(1).strip()
+    return None
+
+
+def extract(raw: bytes) -> Extracted:
+    if len(raw) <= BIG_MIME:
+        return _extract(raw)
+    with _BIG_GATE:
+        return _extract(raw)
+
+
+def _extract(raw: bytes) -> Extracted:
+    try:
+        msg = parse(raw)
+    except Exception as exc:  # noqa: BLE001 — e.g. RecursionError on absurd nesting: index nothing, keep the MIME
+        return Extracted(error=type(exc).__name__)
+    out: list[str] = []
+    attachments: list[str] = []
+    ical_uid = error = None
+    try:
+        _body_text(msg, out, attachments, 0)
+        ical_uid = calendar_uid(msg)
+    except Exception as exc:  # noqa: BLE001 — keep whatever headers we have; the raw MIME stays intact
+        error = type(exc).__name__
+    recipients = ", ".join(h for h in (header(msg, n) for n in ("to", "cc", "bcc")) if h)
+    text = "\n".join(t for t in out if t) + ("\n" + " ".join(attachments) if attachments else "")
+    return Extracted(
+        subject=header(msg, "subject"),
+        sender=header(msg, "from"),
+        recipients=recipients,
+        text=text[:MAX_TEXT],
+        attachments=attachments,
+        ical_uid=ical_uid,
+        error=error,
+    )
+
+
+# Bytes, not characters: NAME_MAX is 255 bytes and a UTF-8 character takes up to 4.
+_MAX_NAME = 200
+
+
+def safe_filename(name: str, content_type: str, index: int) -> str:
+    """A plain file name: no path separator, control character or leading dot (no `..`, no hidden
+    file); unnamed parts are named after their position and content type."""
+    name = "".join("_" if c in "/\\" else c for c in name if c.isprintable()).strip().lstrip(".").strip()
+    if not name:
+        name = f"part-{index}{mimetypes.guess_extension(content_type) or '.bin'}"
+    stem, ext = os.path.splitext(name)
+    if len(ext.encode()) > 16:
+        stem, ext = name, ""
+    return stem.encode()[: _MAX_NAME - len(ext.encode())].decode(errors="ignore") + ext
+
+
+def _same_file(name: str, dir_fd: int, data: bytes) -> bool:
+    # O_NONBLOCK: a planted FIFO must not hang the reader.
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != len(data):
+            return False
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read() == data
+    finally:
+        os.close(fd)
+
+
+def save_attachments(
+    found: Sequence[Attachment], dir_fd: int, out: Path, *, reuse: bool = False
+) -> Iterator[Path]:
+    """Write each attachment into the directory open at `dir_fd` (shown as `out`), owner-only, never
+    overwriting: a taken name gets `-N`; with `reuse`, a taken name already holding the same bytes is
+    yielded instead. Yields each path once written; a failed write leaves no partial file behind."""
+    # Security: names are opened relative to the directory fd, so a swapped path cannot redirect them.
+    for index, att in enumerate(found, 1):
+        stem, ext = os.path.splitext(safe_filename(att.filename, att.content_type, index))
+        for n in range(1000):
+            name = f"{stem}-{n}{ext}" if n else f"{stem}{ext}"
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+            except FileExistsError:
+                if reuse and _same_file(name, dir_fd, att.data):
+                    yield out / name
+                    break
+                continue
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(att.data)
+            except BaseException:  # Ctrl-C / SIGTERM mid-write too
+                with suppress(OSError):
+                    os.unlink(name, dir_fd=dir_fd)
+                raise
+            yield out / name
+            break
+        else:
+            raise FileExistsError(f"no free name for {stem}{ext} in {out}")
