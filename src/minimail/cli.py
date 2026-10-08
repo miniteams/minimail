@@ -34,15 +34,19 @@ def _graph(settings: Settings) -> Graph:
 
 
 def _print_folders(db: sqlite3.Connection, folders: Sequence[sqlite3.Row]) -> int:
-    """Server vs local count per folder; returns how many differ."""
+    """Server items, server messages and local messages per folder; `≠` marks (and the return value
+    counts) folders whose local count differs from the server's message count."""
     local = local_counts(db)
     differ = 0
-    print(f"{'server':>8} {'local':>8}  path")
+    print(f"{'items':>8} {'messages':>8} {'local':>8}  path")
     for folder in folders:
         mine = local.get(folder["id"], 0)
-        differ += mine != folder["total_count"]
-        mark = "" if mine == folder["total_count"] else "  ≠"
-        print(f"{folder['total_count']:>8} {mine:>8}  {folder['path']}{mark}")
+        messages = folder["message_count"]
+        expected = folder["total_count"] if messages is None else messages
+        differ += mine != expected
+        mark = "" if mine == expected else "  ≠"
+        shown = "?" if messages is None else messages
+        print(f"{folder['total_count']:>8} {shown:>8} {mine:>8}  {folder['path']}{mark}")
     return differ
 
 
@@ -196,4 +200,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 3
     except httpx.HTTPError as exc:
         print(f"minimail: Graph request failed: {exc}", file=sys.stderr)
+        return 1
+    except sqlite3.OperationalError as exc:
+        # The traceback goes to the log: the same error class covers a locked archive and a code bug.
+        log.exception("archive_error", db=str(settings.db_path))
+        print(f"minimail: archive error: {exc} ({settings.db_path})", file=sys.stderr)
         return 1

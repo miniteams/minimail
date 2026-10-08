@@ -119,6 +119,7 @@ def waiter(clock: Clock, waits: list[float], stop: Callable[[], bool]) -> Callab
 
     def wait(seconds: float) -> bool:
         waits.append(seconds)
+        assert len(waits) < 5000, "hot loop: the live loop never lets time pass"
         if stop():
             return True
         clock.now += seconds
@@ -141,7 +142,7 @@ def _deltas(fake: LiveGraph) -> list[tuple[float, str]]:
     return [(t, e) for t, e in fake.events if not e.startswith("$value")]
 
 
-def test_cadence_order_tree_then_inbox_then_others(db: sqlite3.Connection, pool: ThreadPoolExecutor) -> None:
+def test_cadence_order(db: sqlite3.Connection, pool: ThreadPoolExecutor) -> None:
     clock = Clock()
     fake = LiveGraph(clock)
     waits: list[float] = []
@@ -149,7 +150,8 @@ def test_cadence_order_tree_then_inbox_then_others(db: sqlite3.Connection, pool:
         make_graph(fake), db, pool, CADENCE, wait=waiter(clock, waits, lambda: clock() >= 900), clock=clock
     )
     assert fake.events[:3] == [(0, "tree"), (0, "INBOX:0"), (0, "F2:0")]
-    assert fake.events[-3:] == [(900, "tree"), (900, "INBOX:0"), (900, "F2:0")]
+    # The first walk precedes the Inbox (it finds it); a refresh follows the Inbox round.
+    assert fake.events[-3:] == [(900, "INBOX:0"), (900, "tree"), (900, "F2:0")]
     assert [t for t, _ in _calls(fake, "INBOX")] == [30.0 * k for k in range(31)]
     assert [t for t, _ in _calls(fake, "F2")] == [0, 300, 600, 900]
     assert [t for t, _ in _calls(fake, "tree")] == [0, 900]

@@ -1,5 +1,6 @@
 import os
 import signal
+import sqlite3
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
@@ -80,7 +81,7 @@ def test_sync_then_verify_then_corruption(
     _seed(env, monkeypatch, fake)
     assert cli.main(["sync"]) == 0
     out = capsys.readouterr().out
-    assert "       2        2  Inbox" in out and "≠" not in out
+    assert "       2        ?        2  Inbox" in out and "≠" not in out
     assert cli.main(["verify", "--refetch", "2"]) == 0
     assert "checked=2 mismatches=0 refetched=2 refetch_mismatches=0" in capsys.readouterr().out
     with closing(open_db(env / "data")) as db:
@@ -247,3 +248,92 @@ def test_interrupt_closes_graph_before_draining_workers(env: Path, monkeypatch: 
     monkeypatch.setattr(cli, "run_live", interrupted)
     assert cli.main(["sync", "--live"]) == 130
     assert order == ["graph.close", "executor.shutdown"]
+
+
+def test_folder_listing_compares_local_to_the_message_count(
+    db: sqlite3.Connection, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """001-AC1: ≠ flags a folder whose local count differs from messages/$count, not from the item
+    count (which includes non-mail items); without a message count, the item count is the reference."""
+    rows = [
+        ("A", "Deleted Items", 9, 7),  # local 7: matches the messages, not the items
+        ("B", "Inbox", 3, 3),  # local 2: one message missing
+        ("C", "Odd", 4, None),  # local 4: no $count, matches the items
+        ("D", "Odd2", 5, None),  # local 4: no $count, differs from the items
+    ]
+    local = {"A": 7, "B": 2, "C": 4, "D": 4}
+    for fid, path, items, messages in rows:
+        db.execute(
+            "INSERT INTO folders (id, display_name, path, total_count, message_count) VALUES (?, ?, ?, ?, ?)",
+            (fid, path, path, items, messages),
+        )
+        for n in range(local[fid]):
+            db.execute(
+                "INSERT INTO messages (id, folder_id, meta, first_seen_at, updated_at) "
+                "VALUES (?, ?, '{}', 't', 't')",
+                (f"{fid}{n}", fid),
+            )
+    folders = db.execute("SELECT * FROM folders ORDER BY path").fetchall()
+    assert cli._print_folders(db, folders) == 2
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == [
+        "   items messages    local  path",
+        "       9        7        7  Deleted Items",
+        "       3        3        2  Inbox  ≠",
+        "       4        ?        4  Odd",
+        "       5        ?        4  Odd2  ≠",
+    ]
+
+
+def _stderr(capsys: pytest.CaptureFixture[str]) -> tuple[list[str], list[dict[str, object]]]:
+    """minimail: lines, and the JSON log records (one per line, nothing else allowed)."""
+    import json
+
+    lines = capsys.readouterr().err.splitlines()
+    messages = [line for line in lines if line.startswith("minimail:")]
+    records = [json.loads(line) for line in lines if not line.startswith("minimail:")]
+    return messages, records
+
+
+def test_locked_archive_is_a_one_line_error(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Another writer holding the archive past the busy timeout: exit 1 with one stderr line; the
+    traceback sits in a single JSON log record."""
+    from minimail import store
+
+    data = env / "data"
+    data.mkdir()
+    with closing(sqlite3.connect(data / "mail.db")) as old:
+        old.execute(
+            "CREATE TABLE folders (id TEXT PRIMARY KEY, parent_id TEXT, display_name TEXT NOT NULL, "
+            "path TEXT NOT NULL, total_count INTEGER NOT NULL DEFAULT 0, deleted_at TEXT)"
+        )
+        old.commit()
+    monkeypatch.setattr(store, "BUSY_TIMEOUT", 0.05)
+    with closing(sqlite3.connect(data / "mail.db", isolation_level=None)) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        assert cli.main(["folders"]) == 1
+        writer.execute("ROLLBACK")
+    messages, records = _stderr(capsys)
+    assert len(messages) == 1 and "archive error: database is locked" in messages[0]
+    [record] = [r for r in records if r["event"] == "archive_error"]
+    assert "OperationalError: database is locked" in str(record["exception"])
+
+
+def test_archive_code_bug_keeps_its_traceback(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An OperationalError from a code bug (e.g. a misspelt column) is not passed off as a busy
+    archive: neutral message, exit 1, and the traceback names the failing call."""
+
+    def buggy(settings: object, db: sqlite3.Connection, args: object) -> int:
+        db.execute("SELECT no_such_column FROM folders")
+        return 0
+
+    monkeypatch.setitem(cli.COMMANDS, "folders", buggy)
+    assert cli.main(["folders"]) == 1
+    messages, records = _stderr(capsys)
+    assert len(messages) == 1 and "archive error: no such column" in messages[0]
+    [record] = [r for r in records if r["event"] == "archive_error"]
+    assert "in buggy" in str(record["exception"])

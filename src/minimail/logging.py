@@ -9,15 +9,20 @@ import structlog
 def setup_logging(level: str = "INFO") -> None:
     log_level = getattr(logging, level.upper(), logging.INFO)
     # stderr, so stdout stays clean for command output (`search … | jq`).
-    renderer: structlog.typing.Processor = (
-        structlog.dev.ConsoleRenderer() if sys.stderr.isatty() else structlog.processors.JSONRenderer()
+    tty = sys.stderr.isatty()
+    # JSON: the traceback becomes one escaped `exception` field, so a record stays one line.
+    # The console renderer formats exceptions itself and warns if they arrive pre-formatted.
+    renderer: list[structlog.typing.Processor] = (
+        [structlog.dev.ConsoleRenderer()]
+        if tty
+        else [structlog.processors.format_exc_info, structlog.processors.JSONRenderer()]
     )
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
-            renderer,
+            *renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
         logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),

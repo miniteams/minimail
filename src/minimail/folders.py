@@ -9,7 +9,8 @@ from typing import Any
 import httpx
 import structlog
 
-from .graph import Graph
+from .graph import SESSION_STATUSES, Graph
+from .mail import path_id
 
 log = structlog.get_logger()
 
@@ -36,28 +37,48 @@ def walk(graph: Graph) -> Iterator[tuple[dict[str, Any], str]]:
                 stack.append((f"me/mailFolders/{folder['id']}/childFolders", full))
 
 
+def message_count(graph: Graph, folder: dict[str, Any], path: str) -> int | None:
+    """Messages only: totalItemCount also counts the non-mail items Deleted Items collects (events,
+    contacts, tasks). None if this count fails (it only feeds the display): the walk goes on."""
+    if not folder.get("totalItemCount"):
+        return 0
+    try:
+        return int(graph.request("GET", f"me/mailFolders/{path_id(folder['id'])}/messages/$count").text)
+    except (httpx.HTTPStatusError, ValueError) as exc:
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        # Session/throttling: fail the walk so a known count is not overwritten with NULL.
+        if status in SESSION_STATUSES:
+            raise
+        log.warning("message_count_unavailable", path=path, error=type(exc).__name__, status=status)
+        return None
+
+
 def sync_folders(graph: Graph, db: sqlite3.Connection) -> list[sqlite3.Row]:
     """Upsert the server tree; folders gone from it are tombstoned, never dropped (their messages
     keep pointing at them). Returns the live folders."""
     now = datetime.now(UTC).isoformat()
-    seen = list(walk(graph))
+    # Counted before the transaction: no write lock held across network calls.
+    seen = [(folder, full, message_count(graph, folder, full)) for folder, full in walk(graph)]
     with db:
-        for folder, full in seen:
+        for folder, full, messages in seen:
             db.execute(
-                """INSERT INTO folders (id, parent_id, display_name, path, total_count, deleted_at)
-                   VALUES (?, ?, ?, ?, ?, NULL)
+                """INSERT INTO folders (id, parent_id, display_name, path, total_count, message_count,
+                     deleted_at)
+                   VALUES (?, ?, ?, ?, ?, ?, NULL)
                    ON CONFLICT(id) DO UPDATE SET parent_id=excluded.parent_id,
                      display_name=excluded.display_name, path=excluded.path,
-                     total_count=excluded.total_count, deleted_at=NULL""",
+                     total_count=excluded.total_count, message_count=excluded.message_count,
+                     deleted_at=NULL""",
                 (
                     folder["id"],
                     folder.get("parentFolderId"),
                     folder["displayName"],
                     full,
                     folder.get("totalItemCount") or 0,
+                    messages,
                 ),
             )
-        ids = [folder["id"] for folder, _ in seen]
+        ids = [folder["id"] for folder, _, _ in seen]
         marks = ",".join("?" * len(ids))
         gone = db.execute(
             f"UPDATE folders SET deleted_at=? WHERE deleted_at IS NULL AND id NOT IN ({marks})", (now, *ids)

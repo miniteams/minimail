@@ -11,7 +11,7 @@ import structlog
 
 from .auth import AuthExpired, AuthUnavailable
 from .folders import sync_folders
-from .graph import Graph
+from .graph import SESSION_STATUSES, Graph
 from .mail import Counters, sync_folder
 
 log = structlog.get_logger()
@@ -20,9 +20,8 @@ _SUMMED = ("listed", "downloaded", "failed", "moved", "deleted")
 # A folder's own failures (gone, forbidden, 5xx, refused or malformed page) skip that folder only.
 # Read/write timeouts are tied to one item (a huge or stuck $value); connect errors mean the network.
 _FOLDER_ERRORS = (httpx.HTTPStatusError, httpx.ReadTimeout, httpx.WriteTimeout, ValueError, RuntimeError)
-# Statuses about the session or the whole mailbox: the cycle backs off instead of trying each folder.
-# 503/504 stay per folder: one folder's backend can keep failing while the others answer.
-_MAILBOX_STATUSES = frozenset({401, 429})
+# SESSION_STATUSES back off the whole cycle; 503/504 stay per folder: one folder's backend can keep
+# failing while the others answer.
 # What a live cycle survives: sign-in and network outages, mailbox-wide throttling, Graph answering
 # garbage to the tree walk, a busy or flaky archive disk (NAS I/O, "database is locked").
 _RETRIED = (
@@ -67,7 +66,7 @@ def _attempt(
         return _round(graph, db, executor, folder, pause)
     except _FOLDER_ERRORS as exc:
         status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
-        if isinstance(exc, AuthExpired | AuthUnavailable) or status in _MAILBOX_STATUSES:
+        if isinstance(exc, AuthExpired | AuthUnavailable) or status in SESSION_STATUSES:
             raise
         log.warning(
             "folder_round_failed",
@@ -118,29 +117,36 @@ def run_live(
     def inbox_due() -> bool:
         return clock() >= due_inbox
 
+    def walk_tree(now: float) -> None:
+        nonlocal inbox, others, pending, walked, due_tree
+        try:
+            folders = sync_folders(graph, db)
+            inbox_id = graph.get("me/mailFolders/inbox", **{"$select": "id"})["id"]
+        except _RETRIED as exc:
+            if not walked:
+                raise
+            # The previous tree still serves: a failed refresh must not stop the Inbox.
+            log.warning("tree_walk_failed", error=type(exc).__name__, detail=str(exc)[:200])
+            due_tree = clock() + cadence.tree
+            return
+        inbox = [f for f in folders if f["id"] == inbox_id]
+        others = [f for f in folders if f["id"] != inbox_id]
+        pending = []  # rows of the old tree; the cursors in sync_state keep the progress
+        walked = True
+        due_tree = now + cadence.tree
+
     while True:
         now = clock()
         try:
-            if now >= due_tree:
-                try:
-                    folders = sync_folders(graph, db)
-                    inbox_id = graph.get("me/mailFolders/inbox", **{"$select": "id"})["id"]
-                except _RETRIED as exc:
-                    if not walked:
-                        raise
-                    # The previous tree still serves: a failed refresh must not stop the Inbox.
-                    log.warning("tree_walk_failed", error=type(exc).__name__, detail=str(exc)[:200])
-                    due_tree = clock() + cadence.tree
-                else:
-                    inbox = [f for f in folders if f["id"] == inbox_id]
-                    others = [f for f in folders if f["id"] != inbox_id]
-                    pending = []  # rows of the old tree; the cursors in sync_state keep the progress
-                    walked = True
-                    due_tree = now + cadence.tree
+            if not walked and now >= due_tree:
+                walk_tree(now)  # the Inbox round needs a tree to find the Inbox
             if now >= due_inbox:
                 for folder in inbox:
                     _attempt(graph, db, executor, folder)
                 due_inbox = clock() + cadence.inbox
+            # A refresh runs after the Inbox round: walk time never delays a due Inbox.
+            if walked and now >= due_tree:
+                walk_tree(now)
             if now >= due_folders:
                 if not pending:
                     pending, requeued = list(others), set()

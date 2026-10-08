@@ -187,8 +187,18 @@ def test_removed_then_404_is_tombstoned_not_dropped(db: sqlite3.Connection, pool
     assert local_counts(db) == {}
 
 
+def _visible_folders(db: sqlite3.Connection, *ids: str, gone: str | None = None) -> None:
+    with db:
+        for fid in ids:
+            db.execute(
+                "INSERT INTO folders (id, display_name, path, deleted_at) VALUES (?, ?, ?, ?)",
+                (fid, fid, fid, "2026-01-01T00:00:00+00:00" if fid == gone else None),
+            )
+
+
 def test_removed_but_alive_elsewhere_is_a_move(db: sqlite3.Connection, pool: ThreadPoolExecutor) -> None:
-    """001-AC5: a move updates the folder and never refetches the MIME."""
+    """001-AC5: a move to a folder of the visible tree updates the folder and never refetches the MIME."""
+    _visible_folders(db, FOLDER, "F2")
     fake = FakeGraph([[item("m1")]])
     graph = make_graph(fake)
     sync_folder(graph, db, pool, FOLDER)
@@ -196,6 +206,26 @@ def test_removed_but_alive_elsewhere_is_a_move(db: sqlite3.Connection, pool: Thr
     fake.messages = {"m1": "F2"}
     assert sync_folder(graph, db, pool, FOLDER).moved == 1
     assert db.execute("SELECT folder_id, deleted_at FROM messages").fetchone()[:] == ("F2", None)
+    assert fake.value_calls["m1"] == 1
+
+
+@pytest.mark.parametrize("parent", ["RECOVERABLE", "GONE"])
+def test_removed_and_parked_outside_the_visible_tree_is_a_deletion(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, parent: str
+) -> None:
+    """001-AC5: a soft delete leaves the message readable (GET 200) under a folder outside the visible
+    tree (hidden Recoverable Items, or a tombstoned folder): tombstoned like a 404, last visible
+    folder kept, MIME kept and not refetched."""
+    _visible_folders(db, FOLDER, "GONE", gone="GONE")
+    fake = FakeGraph([[item("m1")]])
+    graph = make_graph(fake)
+    sync_folder(graph, db, pool, FOLDER)
+    fake.pages = [[{"id": "m1", "@removed": {"reason": "deleted"}}]]
+    fake.messages = {"m1": parent}
+    c = sync_folder(graph, db, pool, FOLDER)
+    assert (c.deleted, c.moved) == (1, 0)
+    row = db.execute("SELECT folder_id, deleted_at, mime FROM messages WHERE id='m1'").fetchone()
+    assert row["folder_id"] == FOLDER and row["deleted_at"] is not None and row["mime"] is not None
     assert fake.value_calls["m1"] == 1
 
 
@@ -313,3 +343,20 @@ def test_mime_catch_up_yields_in_page_sized_chunks(
     assert (c.paused, c.downloaded) == (True, 2)
     c = sync_folder(graph, db, pool, FOLDER, pause=lambda: False)
     assert (c.paused, c.downloaded) == (False, 3)
+
+
+def test_move_into_a_folder_newer_than_the_tree_heals_on_its_first_round(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """001-AC5: a move into a folder the last tree walk has not seen yet is first taken for a deletion;
+    the new folder's first round lists the message, which revives it there without a refetch."""
+    _visible_folders(db, FOLDER)
+    fake = FakeGraph([[item("m1")]])
+    sync_folder(make_graph(fake), db, pool, FOLDER)
+    fake.pages = [[{"id": "m1", "@removed": {"reason": "deleted"}}]]
+    fake.messages = {"m1": "NEW"}
+    assert sync_folder(make_graph(fake), db, pool, FOLDER).deleted == 1
+    _visible_folders(db, "NEW")  # the next tree walk
+    sync_folder(make_graph(FakeGraph([[item("m1", "NEW")]])), db, pool, "NEW")
+    assert db.execute("SELECT folder_id, deleted_at FROM messages").fetchone()[:] == ("NEW", None)
+    assert fake.value_calls["m1"] == 1

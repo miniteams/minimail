@@ -53,7 +53,8 @@ is lost locally.
 ## Acceptance criteria
 
 - [ ] **AC1** After `minimail sync` completes, every server folder and subfolder exists locally with its
-  full path, and per folder the local non-tombstoned count equals Graph `totalItemCount`.
+  full path, and per folder the local non-tombstoned count equals the folder's message count
+  (`GET …/mailFolders/{id}/messages/$count`).
 - [ ] **AC2** Each stored MIME decompresses to bytes identical to `GET …/$value`; `minimail verify`
   re-checks the recorded sha256 of every message and reports mismatches.
 - [ ] **AC3** A sync killed mid-backfill (`kill -INT`, `kill -9`) resumes without re-downloading
@@ -97,7 +98,8 @@ is lost locally.
 - Work: uv project (python.md tooling, pre-commit), `MINIMAIL_` settings, shared-cache token source,
   Graph client with Retry-After handling, `folders` table + tree sync, `minimail folders`.
 - **Covers**: AC10, AC11, AC13
-- **Data model impact**: `folders` (id, parent_id, display_name, path, total_count, deleted_at)
+- **Data model impact**: `folders` (id, parent_id, display_name, path, total_count, deleted_at,
+  message_count — added in place to existing archives)
 - **DoD**: `minimail folders` prints every server folder with counts matching Graph; tests for 429 retry and
   missing-token exit green; `pre-commit run --all-files` clean.
 
@@ -115,11 +117,12 @@ is lost locally.
 
 ### Phase 3 — Delta sync and `--live`
 - Work: per-folder message delta + folder tree re-walk, tombstones, moves, metadata-only updates,
-  cadence loop (30 s / 5 min / 15 min, `MINIMAIL_{INBOX,FOLDERS,TREE}_EVERY`): tree → Inbox → other
-  folders, which yield between rounds, pages and catch-up chunks once the Inbox is due; a failing
-  folder is skipped for the rest of the pass; a failed cycle (including at start-up) is logged and
-  retried one Inbox interval later; client-side request pacing (`MINIMAIL_MAX_RPS`); clean stop on
-  SIGINT/SIGTERM (exit 130); `--live` refuses `--folder`.
+  cadence loop (30 s / 5 min / 15 min, `MINIMAIL_{INBOX,FOLDERS,TREE}_EVERY`): Inbox → tree refresh →
+  other folders (the very first walk precedes the Inbox, which it locates); the other folders
+  yield between rounds, pages and catch-up chunks once the Inbox is due; a failing folder is skipped
+  for the rest of the pass; a failed cycle (including at start-up) is logged and retried one Inbox
+  interval later; client-side request pacing (`MINIMAIL_MAX_RPS`); clean stop on SIGINT/SIGTERM
+  (exit 130); `--live` refuses `--folder`.
 - **Covers**: AC4, AC5, AC6
 - **Data model impact**: none (`sync_state` arrives in phase 2)
 - **DoD**: live test: send self a mail → searchable < 60 s; delete/move/flag one → reflected without a
@@ -170,6 +173,11 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
 - **`search_text` is a dedicated decoded column**, not FTS over raw MIME — encodings would defeat it.
 - **Attachments extracted on demand** from the MIME, not stored twice.
 - **Archive semantics**: deletions are tombstones, never local deletes.
+- **Deleted = 404 or a parent outside the visible tree** (AC5): a soft delete (Shift+Delete, emptying
+  Deleted Items) keeps the message readable under the hidden Recoverable Items folder, so a `@removed`
+  whose `GET` answers 200 with a parent that is not a live folder of `folders` is tombstoned like a
+  404 (last visible folder kept); a move into a folder newer than the last tree walk heals on that
+  folder's first round.
 - **Backfill = first delta round** per folder: one code path for backfill and incremental sync, one
   resume cursor (`sync_state.next_link`); hence `sync_state` lands in phase 2.
 - **Only permanent 4xx are recorded as download failures**; throttling, auth and 5xx stop the round,
@@ -187,6 +195,12 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
 - **Calendar verbatim = raw Graph JSON** — Graph has no per-event iCalendar export.
 - **Window start = earliest event** (probed once with a wide window); end slides daily.
 - **Bounded memory**: `--live` runs forever; any per-message cache is LRU-bounded.
+- **AC1 counts messages, not items**: `totalItemCount` also counts the non-mail items a folder holds
+  (Deleted Items keeps deleted events, contacts and tasks), which `messages/delta` never lists; the
+  tree walk records `messages/$count` beside it (only for non-empty folders). A count that fails on
+  its own (any error status but 401/429, a non-integer body) is stored NULL and the item count is the
+  reference; 401/429 fail the walk so a known count is never overwritten. The column is added to
+  existing archives in place, under a write lock and re-checked once the lock is held.
 - **Request pacing** (`MINIMAIL_MAX_RPS`, default 8/s): minimail borrows the Teams client's app id, so
   Graph's per-app-per-mailbox quota (~10k requests / 10 min ≈ 16/s) is shared with the user's own
   Teams; 8/s leaves it half. One lock-guarded slot schedule in `graph.Graph` covers every request,
@@ -197,7 +211,8 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
   round. A fixed page budget cannot bound the wait: a page costs up to ~100 requests (`$value` or
   move lookups), ~12 s at 8/s. A round's first delta page always runs, so every round progresses.
   AC4 worst case ≈ Inbox interval (30 s) + the one unit already running when the Inbox fell due
-  (≤ ~100 requests, ~12 s at 8/s) + the Inbox round itself.
+  (≤ ~100 requests, ~12 s at 8/s) + the Inbox round itself; a tree refresh never sits in between,
+  it runs after the Inbox round.
 - **A failing folder does not stop the others**: a folder round (Inbox included) failing on its own
   — HTTP error status (folder gone, forbidden, 5xx including 503/504 left after retries), a read
   or write timeout (one huge or stuck item), non-JSON

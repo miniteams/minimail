@@ -119,26 +119,35 @@ def _upsert_meta(db: sqlite3.Connection, folder_id: str, item: dict[str, Any], n
     )
 
 
+def _tombstone(db: sqlite3.Connection, folder_id: str, msg_id: str) -> int:
+    with db:
+        # Only if it still sits in the folder that reported it: a move already applied wins.
+        return db.execute(
+            "UPDATE messages SET deleted_at=?, updated_at=? "
+            "WHERE id=? AND folder_id=? AND deleted_at IS NULL",
+            (_now(), _now(), msg_id, folder_id),
+        ).rowcount
+
+
 def _handle_removed(graph: Graph, db: sqlite3.Connection, folder_id: str, msg_id: str, c: Counters) -> None:
-    """Delta reports both moves and deletions as `@removed`; ask Graph which one it was."""
+    """Delta reports both moves and deletions as `@removed`; ask Graph which one it was. Deleted =
+    404, or a parent outside the visible tree: a soft delete (Shift+Delete, emptying Deleted Items)
+    keeps the message readable in the hidden Recoverable Items folder."""
     try:
         current = graph.get(f"me/messages/{path_id(msg_id)}", **{"$select": "id,parentFolderId"})
     except httpx.HTTPStatusError as exc:
         if exc.response.status_code != 404:
             raise
-        with db:
-            # Only if it still sits in the folder that reported it: a move already applied wins.
-            hit = db.execute(
-                "UPDATE messages SET deleted_at=?, updated_at=? "
-                "WHERE id=? AND folder_id=? AND deleted_at IS NULL",
-                (_now(), _now(), msg_id, folder_id),
-            ).rowcount
-        c.deleted += hit
+        c.deleted += _tombstone(db, folder_id, msg_id)
+        return
+    parent = current["parentFolderId"]
+    if db.execute("SELECT 1 FROM folders WHERE id=? AND deleted_at IS NULL", (parent,)).fetchone() is None:
+        c.deleted += _tombstone(db, folder_id, msg_id)
         return
     with db:
         hit = db.execute(
             "UPDATE messages SET folder_id=?, updated_at=?, deleted_at=NULL WHERE id=? AND folder_id!=?",
-            (current["parentFolderId"], _now(), msg_id, current["parentFolderId"]),
+            (parent, _now(), msg_id, parent),
         ).rowcount
     c.moved += hit
 
