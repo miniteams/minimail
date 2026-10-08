@@ -93,11 +93,63 @@ class Extracted:
     attachments: list[str] = field(default_factory=list)
 
 
-def _body_text(msg: EmailMessage, out: list[str], attachments: list[str], depth: int) -> None:
+def body_text(msg: EmailMessage) -> str:
+    """The message's own text body (plain preferred, else HTML reduced to its visible text)."""
     body = msg.get_body(preferencelist=("plain", "html"))
-    if body is not None:
-        text = part_text(body)
-        out.append(html_to_text(text) if body.get_content_type() == "text/html" else text)
+    if body is None:
+        return ""
+    text = part_text(body)
+    return html_to_text(text) if body.get_content_type() == "text/html" else text
+
+
+@dataclass
+class Attachment:
+    filename: str  # decoded (RFC 2231/2047), unsanitised; "" when the part has none
+    content_type: str
+    data: bytes  # the part's payload after transfer decoding, byte for byte
+
+
+class _ForwardedAsLeaf(EmailMessage):
+    """Reports `message/rfc822` as a non-`message` type, so the parser keeps a forwarded mail as a
+    leaf whose payload is the verbatim bytes the outer MIME carries instead of re-splitting it."""
+
+    def get_content_maintype(self) -> str:
+        return (
+            "application" if self.get_content_type() == "message/rfc822" else super().get_content_maintype()
+        )
+
+
+_FORWARDED_AS_LEAF = email.policy.default.clone(message_factory=_ForwardedAsLeaf)
+
+
+def attachments(raw: bytes, depth: int = 0) -> list[Attachment]:
+    """Every attachment: a leaf part with a filename or an attachment disposition, or any non-text
+    leaf (e.g. an inline image). A forwarded mail is one (`.eml`), followed by its own attachments
+    while `depth` < 3 (deeper forwards are still listed, not opened)."""
+    found: list[Attachment] = []
+    for part in email.message_from_bytes(raw, policy=_FORWARDED_AS_LEAF).walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename() or ""
+        body_like = part.get_content_maintype() in {"text", "message"}
+        if not filename and body_like and part.get_content_disposition() != "attachment":
+            continue
+        payload = part.get_payload(decode=True)
+        data = payload if isinstance(payload, bytes) else b""
+        if part.get_content_type() != "message/rfc822":
+            found.append(Attachment(filename, part.get_content_type(), data))
+            continue
+        if filename and not filename.lower().endswith(".eml"):
+            filename += ".eml"
+        found.append(Attachment(filename, "message/rfc822", data))
+        # Security: each level copies its nested bytes; unbounded = quadratic memory, RecursionError.
+        if depth < 3:
+            found.extend(attachments(data, depth + 1))
+    return found
+
+
+def _body_text(msg: EmailMessage, out: list[str], attachments: list[str], depth: int) -> None:
+    out.append(body_text(msg))
     for part in _leaves(msg):
         if part.get_content_type() == "message/rfc822":
             # Forwarded mail as attachment: its own headers and body are searchable too.
@@ -129,7 +181,10 @@ def _leaves(msg: Message) -> list[Message]:
 
 
 def extract(raw: bytes) -> Extracted:
-    msg = parse(raw)
+    try:
+        msg = parse(raw)
+    except Exception:  # noqa: BLE001 — e.g. RecursionError on absurd nesting: index nothing, keep the MIME
+        return Extracted()
     out: list[str] = []
     attachments: list[str] = []
     try:

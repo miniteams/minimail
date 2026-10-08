@@ -129,10 +129,15 @@ is lost locally.
   MIME refetch (log shows no `$value` call).
 
 ### Phase 4 — Search, show, attachments
-- Work: FTS5 (`unicode61 remove_diacritics 2`) over subject/from/to/search_text, `search`, `show`,
-  `attachments`.
+- Work: FTS5 (`unicode61 remove_diacritics 2`) over subject/sender/recipients/search_text, kept in
+  step by triggers, added to existing archives in place; `search` (words ANDed, user text never an
+  FTS5 operator, newest first, tombstones only with `--deleted`, `--json`), `show` (decoded headers,
+  folder, flags, attachment list, text body; `--raw`), `attachments --out DIR`; `reindex` rebuilds
+  the index first; SIGINT re-armed at start-up (a background child of a non-interactive shell
+  inherits it ignored).
 - **Covers**: AC7, AC8, AC9
-- **Data model impact**: `messages_fts` (external-content FTS5 on `messages`)
+- **Data model impact**: `messages_fts` (external-content FTS5 on `messages`: subject, sender,
+  recipients, search_text) + insert/update/delete triggers
 - **DoD**: AC7/AC8 fixture tests green; attachment extraction test incl. a `../` filename.
 
 ### Phase 5 — Calendar
@@ -158,7 +163,7 @@ is lost locally.
 ## Data model impact (summary)
 
 New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ical_uid`),
-`messages_fts`, `events`, `events_fts`, `sync_state`.
+`messages_fts` (+ its triggers), `events`, `events_fts`, `sync_state`.
 
 ## Open questions
 
@@ -224,6 +229,25 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
   the walk is retried one tree interval later.
 - **Delta links are checked before they are stored**: a nextLink/deltaLink off the Graph host is
   refused before the page is applied, so it never becomes the folder's saved cursor.
+- **Search index = external-content FTS5 + triggers**: no second copy of the text. Created and filled
+  (`'rebuild'`) in place by the first writer command (`sync`, `folders`, `verify`, `reindex`), under the
+  write lock, re-checked once held, like `message_count`; `search`/`show`/`attachments` open read-only
+  and refuse an archive not yet migrated (exit 2). Its rows
+  key on `messages.rowid`, which a VACUUM may renumber (no INTEGER PRIMARY KEY): `reindex` rebuilds
+  the index before re-extracting, since the update trigger can only edit an index that matches.
+- **Indexed subject = Graph's `subject`** (Exchange decodes RFC 2047); the MIME's own decoding is
+  `mime.extract`'s, tested separately.
+- **Short id = first 12 hex of sha256(id)**: Graph ids share a long per-mailbox prefix, so no prefix
+  of the id itself is short. `show`/`attachments` take the full id or a unique, case-sensitive
+  prefix of it, or a prefix of the short id; resolving hashes every id (milliseconds at this size).
+- **Attachments** = every leaf part with a filename or an `attachment` disposition, plus any non-text
+  leaf (inline images). A `message/rfc822` part is one too, written as `<name>.eml` (`part-N.eml`
+  unnamed) byte-identical to what the outer MIME carries (the parser is told to keep it a leaf, since
+  re-serialising a parsed message refolds headers and line ends), then walked into, 3 levels deep
+  at most (each level copies its bytes). Content = the part after transfer decoding
+  (`get_payload(decode=True)`), byte for byte.
+  Files open with `O_CREAT|O_EXCL|O_NOFOLLOW` relative to the directory's fd: never overwrite, never
+  follow a planted symlink; a taken name gets `-N`.
 - **Throttling is per mailbox**: a 429/503/504 pushes back the next request slot of every thread, and
   `Retry-After` is capped at 60 s. On SIGTERM/SIGINT the client is closed before the download pool
   is drained: closing wakes every thread asleep in a back-off or a pacing slot.

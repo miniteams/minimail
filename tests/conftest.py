@@ -1,6 +1,7 @@
 """Shared fakes: a static token source and a routed Graph mock."""
 
 import os
+import resource
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import closing
@@ -13,6 +14,13 @@ import structlog
 from minimail.config import Settings
 from minimail.graph import Graph
 from minimail.store import open_db
+
+# A runaway test (or mutant) must die with MemoryError, not take the host down; 1 GiB ≈ 10× the suite's peak.
+_AS_CAP = 1 << 30
+_soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
+resource.setrlimit(
+    resource.RLIMIT_AS, (_AS_CAP if _hard == resource.RLIM_INFINITY else min(_AS_CAP, _hard), _hard)
+)
 
 BASE = "https://graph.test/v1.0"
 
@@ -39,6 +47,16 @@ def make_graph(
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(tenant_id="tenant-test", msal_cache=tmp_path / "msal.json", data_dir=tmp_path / "data")
+
+
+@pytest.fixture
+def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Environment for `cli.main`: archive under tmp_path/data, no token."""
+    monkeypatch.chdir(tmp_path)  # no stray .env
+    monkeypatch.setenv("MINIMAIL_TENANT_ID", "tenant-test")
+    monkeypatch.setenv("MINIMAIL_MSAL_CACHE", str(tmp_path / "absent.json"))
+    monkeypatch.setenv("MINIMAIL_DATA_DIR", str(tmp_path / "data"))
+    return tmp_path
 
 
 @pytest.fixture

@@ -5,18 +5,12 @@ from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
 
+import httpx
 import pytest
 
 from minimail import cli
 
-
-@pytest.fixture
-def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.chdir(tmp_path)  # no stray .env
-    monkeypatch.setenv("MINIMAIL_TENANT_ID", "tenant-test")
-    monkeypatch.setenv("MINIMAIL_MSAL_CACHE", str(tmp_path / "absent.json"))
-    monkeypatch.setenv("MINIMAIL_DATA_DIR", str(tmp_path / "data"))
-    return tmp_path
+from .conftest import BASE, make_graph
 
 
 def test_no_token_exits_2_pointing_at_miniteams_login(env: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -186,6 +180,24 @@ def test_live_stops_with_130_on_sigterm_or_ctrl_c(
     assert cadences == [cli.Cadence(7.0, 300.0, 900.0)]
 
 
+@pytest.fixture
+def _sigint_ignored() -> Iterator[None]:
+    # What a non-interactive shell's `cmd &` hands its child; pytest's own handler comes back after.
+    old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    yield
+    signal.signal(signal.SIGINT, old)
+
+
+@pytest.mark.usefixtures("_sigint_ignored")
+def test_sigint_stops_even_when_inherited_ignored(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`kill -INT` / Ctrl-C stops a process launched in the background with SIGINT ignored: exit 130."""
+    from .test_mail import FakeGraph
+
+    _seed(env, monkeypatch, FakeGraph([[]]))
+    monkeypatch.setattr(cli, "run_live", lambda *args: os.kill(os.getpid(), signal.SIGINT))
+    assert cli.main(["sync", "--live"]) == 130
+
+
 def test_graph_is_paced_by_max_rps(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from minimail.config import Settings
 
@@ -337,3 +349,26 @@ def test_archive_code_bug_keeps_its_traceback(
     assert len(messages) == 1 and "archive error: no such column" in messages[0]
     [record] = [r for r in records if r["event"] == "archive_error"]
     assert "in buggy" in str(record["exception"])
+
+
+def test_folder_listings_never_print_terminal_controls(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hostile = "\x1b]0;x\x07 evil \u202e \x9b\nfake-line\r"
+    folder = {"id": "A", "displayName": hostile, "childFolderCount": 0, "totalItemCount": 0}
+    tree = {"me/mailFolders": [folder]}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        key = req.url.path.removeprefix("/v1.0/")
+        if key.endswith("/delta"):
+            return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{BASE}/{key}?deltatoken=t"})
+        return httpx.Response(200, json={"value": tree[key]})
+
+    monkeypatch.setattr(cli, "_graph", lambda settings: make_graph(handler))
+    for argv in (["folders"], ["sync"]):
+        capsys.readouterr()
+        assert cli.main(argv) == 0
+        out = capsys.readouterr().out
+        assert "evil" in out, argv
+        assert not [line for line in out.splitlines() if line.startswith("fake")], argv
+        assert not any(bad in out for bad in ("\x1b", "\x07", "\x9b", "\u202e")), argv

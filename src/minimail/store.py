@@ -62,23 +62,63 @@ def open_db(data_dir: Path) -> sqlite3.Connection:
     return db
 
 
+# External content: the index stores no second copy of the text. VACUUM may renumber `messages`
+# rowids (no INTEGER PRIMARY KEY), which `minimail reindex` repairs with a rebuild.
+_FTS = (
+    """CREATE VIRTUAL TABLE messages_fts USING fts5(subject, sender, recipients, search_text,
+         content='messages', tokenize='unicode61 remove_diacritics 2')""",
+    """CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+         INSERT INTO messages_fts (rowid, subject, sender, recipients, search_text)
+         VALUES (new.rowid, new.subject, new.sender, new.recipients, new.search_text);
+       END""",
+    """CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+         INSERT INTO messages_fts (messages_fts, rowid, subject, sender, recipients, search_text)
+         VALUES ('delete', old.rowid, old.subject, old.sender, old.recipients, old.search_text);
+       END""",
+    """CREATE TRIGGER messages_fts_update AFTER UPDATE OF subject, sender, recipients, search_text
+       ON messages BEGIN
+         INSERT INTO messages_fts (messages_fts, rowid, subject, sender, recipients, search_text)
+         VALUES ('delete', old.rowid, old.subject, old.sender, old.recipients, old.search_text);
+         INSERT INTO messages_fts (rowid, subject, sender, recipients, search_text)
+         VALUES (new.rowid, new.subject, new.sender, new.recipients, new.search_text);
+       END""",
+    "INSERT INTO messages_fts (messages_fts) VALUES ('rebuild')",
+)
+
+
 def _has_message_count(db: sqlite3.Connection) -> bool:
     return "message_count" in {row["name"] for row in db.execute("PRAGMA table_info(folders)")}
 
 
+def _has_fts(db: sqlite3.Connection) -> bool:
+    return db.execute("SELECT 1 FROM sqlite_master WHERE name='messages_fts'").fetchone() is not None
+
+
+def needs_migration(db: sqlite3.Connection) -> bool:
+    return not (_has_message_count(db) and _has_fts(db))
+
+
 def _migrate(db: sqlite3.Connection) -> None:
-    """Archives created before message_count existed are migrated in place, never recreated."""
-    if _has_message_count(db):
+    """Archives from earlier versions are migrated in place, never recreated."""
+    if not needs_migration(db):
         return
     db.execute("BEGIN IMMEDIATE")
     try:
         # Re-checked under the write lock: another process may have migrated while we waited.
         if not _has_message_count(db):
             db.execute("ALTER TABLE folders ADD COLUMN message_count INTEGER")
+        if not _has_fts(db):
+            for statement in _FTS:
+                db.execute(statement)
         db.commit()
     except BaseException:
         db.rollback()
         raise
+
+
+def rebuild_fts(db: sqlite3.Connection) -> None:
+    with db:
+        db.execute(_FTS[-1])
 
 
 def open_readonly(data_dir: Path) -> sqlite3.Connection:
