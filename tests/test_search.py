@@ -253,7 +253,9 @@ def test_archive_already_indexed_is_left_untouched(tmp_path: Path, monkeypatch: 
     with closing(sqlite3.connect(tmp_path / "mail.db", isolation_level=None)) as writer:
         before = (schema(writer), writer.execute("PRAGMA schema_version").fetchone())
         triggers = {r[0] for r in writer.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
-        assert triggers == {"messages_fts_insert", "messages_fts_delete", "messages_fts_update"}
+        assert triggers == {
+            f"{t}_fts_{op}" for t in ("messages", "events") for op in ("insert", "delete", "update")
+        }
         monkeypatch.setattr(store, "BUSY_TIMEOUT", 0.05)
         writer.execute("BEGIN IMMEDIATE")
         with closing(open_db(tmp_path)) as db:

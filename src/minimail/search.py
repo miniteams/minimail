@@ -35,18 +35,18 @@ def search(
     ).fetchall()
 
 
-def resolve(db: sqlite3.Connection, ref: str) -> str:
-    """Full message id from a full id, or a unique prefix of it or of its short id. Raises
-    LookupError (unknown or ambiguous)."""
-    if db.execute("SELECT 1 FROM messages WHERE id=?", (ref,)).fetchone():
+def resolve(db: sqlite3.Connection, ref: str, table: str = "messages") -> str:
+    """Full message (or event, with `table="events"`) id from a full id, or a unique prefix of it or
+    of its short id. Raises LookupError (unknown or ambiguous)."""
+    if db.execute(f"SELECT 1 FROM {table} WHERE id=?", (ref,)).fetchone():
         return ref
     hex_ref = ref.lower()
     # ponytail: full scan hashing every id (tens of thousands: milliseconds); store short ids if it grows.
     matches: list[str] = [
         row[0]
-        for row in db.execute("SELECT id FROM messages")
+        for row in db.execute(f"SELECT id FROM {table}")
         if ref and (row[0].startswith(ref) or short_id(row[0]).startswith(hex_ref))
     ]
     if len(matches) != 1:
-        raise LookupError(f"{'no' if not matches else 'ambiguous'} message id {ref!r}")
+        raise LookupError(f"{'no' if not matches else 'ambiguous'} {table.removesuffix('s')} id {ref!r}")
     return matches[0]

@@ -99,3 +99,88 @@ def test_migration_blocked_by_another_writer_fails_cleanly(
         writer.execute("ROLLBACK")
     with closing(sqlite3.connect(tmp_path / "mail.db")) as check:
         assert "message_count" not in [r[1] for r in check.execute("PRAGMA table_info(folders)")]
+
+
+def _pre_calendar_archive(path: Path) -> None:
+    """An archive as phase 4 left it: no events, no messages.ical_uid, no sync_state.window_end."""
+    with closing(open_db(path)) as db:
+        for statement in (
+            *(f"DROP TRIGGER events_fts_{op}" for op in ("insert", "delete", "update")),
+            "DROP TABLE events_fts",
+            "DROP TABLE events",
+            "DROP INDEX messages_ical_uid",
+            "ALTER TABLE messages DROP COLUMN ical_uid",
+            "ALTER TABLE sync_state DROP COLUMN window_end",
+            "INSERT INTO messages (id, folder_id, meta, first_seen_at, updated_at) "
+            "VALUES ('m', 'F', '{}', 't', 't')",
+            "INSERT INTO sync_state (key, delta_link, updated_at) VALUES ('folder:F', 'd', 't')",
+        ):
+            db.execute(statement)
+        db.commit()
+
+
+def _event(db: sqlite3.Connection) -> None:
+    db.execute(
+        "INSERT INTO events (id, subject, raw, search_text, first_seen_at, updated_at) "
+        "VALUES ('e', 'Agenda review', '{}', 'Salle été', 't', 't')"
+    )
+
+
+def test_existing_archive_gains_the_calendar_in_place(tmp_path: Path) -> None:
+    """001-AC14, 001-AC19: events, events_fts, messages.ical_uid and sync_state.window_end are added in
+    place; rows survive; readers refuse the archive until then; a second open is a no-op."""
+    _pre_calendar_archive(tmp_path)
+    with closing(store.open_readonly(tmp_path)) as reader:
+        assert store.needs_migration(reader)
+    for attempt in range(2):
+        with closing(open_db(tmp_path)) as db:
+            assert not store.needs_migration(db)
+            assert tuple(db.execute("SELECT id, ical_uid FROM messages").fetchone()) == ("m", None)
+            assert tuple(db.execute("SELECT key, window_end FROM sync_state").fetchone()) == (
+                "folder:F",
+                None,
+            )
+            if not attempt:
+                _event(db)
+                db.commit()
+            hits = db.execute("SELECT rowid FROM events_fts WHERE events_fts MATCH 'salle ete'").fetchall()
+            assert len(hits) == 1
+
+
+def test_calendar_migration_rechecks_under_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Another process adding the calendar between our check and our lock must not make us add it twice."""
+    _pre_calendar_archive(tmp_path)
+    open_db(tmp_path).close()  # the "other process"
+    real = store._has_calendar
+    answers = iter([False])
+
+    def has_calendar(db: sqlite3.Connection) -> bool:
+        return next(answers, None) is not False and real(db)
+
+    monkeypatch.setattr(store, "_has_calendar", has_calendar)
+    with closing(open_db(tmp_path)) as db:
+        assert [r["name"] for r in db.execute("PRAGMA table_info(messages)")].count("ical_uid") == 1
+
+
+def test_calendar_migration_blocked_by_another_writer_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _pre_calendar_archive(tmp_path)
+    monkeypatch.setattr(store, "BUSY_TIMEOUT", 0.05)
+    with closing(sqlite3.connect(tmp_path / "mail.db", isolation_level=None)) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            open_db(tmp_path)
+        writer.execute("ROLLBACK")
+    with closing(sqlite3.connect(tmp_path / "mail.db")) as check:
+        assert check.execute("SELECT name FROM sqlite_master WHERE name LIKE 'events%'").fetchall() == []
+        assert "ical_uid" not in [r[1] for r in check.execute("PRAGMA table_info(messages)")]
+
+
+def test_reindex_rebuilds_the_event_index(tmp_path: Path) -> None:
+    with closing(open_db(tmp_path)) as db:
+        _event(db)
+        db.execute("INSERT INTO events_fts (events_fts) VALUES ('delete-all')")
+        db.commit()
+        store.rebuild_fts(db)
+        assert len(db.execute("SELECT rowid FROM events_fts WHERE events_fts MATCH 'agenda'").fetchall()) == 1

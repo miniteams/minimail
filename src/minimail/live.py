@@ -10,6 +10,7 @@ import httpx
 import structlog
 
 from .auth import AuthExpired, AuthUnavailable
+from .calendar import sync_calendar
 from .folders import sync_folders
 from .graph import SESSION_STATUSES, Graph
 from .mail import Counters, Reconciled, reconcile_steps, sync_folder
@@ -66,16 +67,29 @@ def _attempt(
     try:
         return _round(graph, db, executor, folder, pause)
     except FOLDER_ERRORS as exc:
-        folder_failed(exc, folder, "folder_round_failed")
+        folder_failed(exc, folder["path"], "folder_round_failed")
         return None
 
 
-def folder_failed(exc: Exception, folder: sqlite3.Row, event: str) -> None:
+def calendar_round(
+    graph: Graph, db: sqlite3.Connection, executor: Executor, pause: Callable[[], bool] | None = None
+) -> None:
+    """The calendar is one more isolated folder: its own failures are logged, mailbox-wide ones propagate."""
+    try:
+        c = sync_calendar(graph, db, executor, pause)
+    except FOLDER_ERRORS as exc:
+        folder_failed(exc, "(calendar)", "calendar_round_failed")
+        return
+    if any(getattr(c, name) for name in _SUMMED):
+        log.info("calendar_synced", **vars(c))
+
+
+def folder_failed(exc: Exception, path: str, event: str) -> None:
     """Log a failure of the folder itself; re-raise a mailbox-wide one."""
     status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
     if isinstance(exc, AuthExpired | AuthUnavailable) or status in SESSION_STATUSES:
         raise exc
-    log.warning(event, path=folder["path"], error=type(exc).__name__, status=status, detail=str(exc)[:200])
+    log.warning(event, path=path, error=type(exc).__name__, status=status, detail=str(exc)[:200])
 
 
 def sync_pass(
@@ -104,7 +118,7 @@ def run_live(
     wait: Callable[[float], bool] = _sleep,
     clock: Callable[[], float] = time.monotonic,
 ) -> None:
-    """Folder tree every `cadence.tree`, Inbox every `cadence.inbox`, the other folders every
+    """Folder tree every `cadence.tree`, Inbox then calendar every `cadence.inbox`, the other folders every
     `cadence.folders`, a reconcile pass of every folder every `cadence.reconcile` (after the other
     folders, yielding to the Inbox like them). Survives sign-in and Graph outages (retries one Inbox
     interval later); stops when `wait` returns True or on KeyboardInterrupt (SIGINT/SIGTERM)."""
@@ -149,6 +163,8 @@ def run_live(
                 for folder in inbox:
                     _attempt(graph, db, executor, folder)
                 due_inbox = clock() + cadence.inbox
+                # Same cadence as the Inbox; a long round (backfill, window slide) yields to it.
+                calendar_round(graph, db, executor, inbox_due)
             # A refresh runs after the Inbox round: walk time never delays a due Inbox.
             if walked and now >= due_tree:
                 walk_tree(now)
@@ -185,7 +201,7 @@ def run_live(
                         log.info("folder_reconciled", path=folder["path"], **job[1].summary())
                     except FOLDER_ERRORS as exc:
                         job = None  # a generator that raised is finished; a mailbox-wide error retries it
-                        folder_failed(exc, folder, "folder_reconcile_failed")
+                        folder_failed(exc, folder["path"], "folder_reconcile_failed")
                     job = None
                     to_reconcile.pop(0)
                 if not to_reconcile:

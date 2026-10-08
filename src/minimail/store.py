@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_folder ON messages(folder_id);
 CREATE INDEX IF NOT EXISTS messages_received ON messages(received_at);
 CREATE TABLE IF NOT EXISTS sync_state (
-    key TEXT PRIMARY KEY,               -- `folder:<id>` (later `calendar`)
+    key TEXT PRIMARY KEY,               -- `folder:<id>` or `calendar`
     next_link TEXT,                     -- mid-round cursor: resume here after a crash
     delta_link TEXT,                    -- end-of-round cursor: next incremental round
     updated_at TEXT NOT NULL
@@ -86,6 +86,48 @@ _FTS = (
 )
 
 
+# Calendar (phase 5): one marker, events_fts, for every change below (one transaction).
+_CALENDAR = (
+    "ALTER TABLE messages ADD COLUMN ical_uid TEXT",  # UID of the MIME's text/calendar part
+    "CREATE INDEX messages_ical_uid ON messages(ical_uid)",
+    "ALTER TABLE sync_state ADD COLUMN window_end TEXT",  # calendar window end the cursor belongs to
+    """CREATE TABLE events (
+         id TEXT PRIMARY KEY,           -- Graph immutable event id
+         type TEXT,                     -- seriesMaster, singleInstance, exception, occurrence
+         series_master_id TEXT,
+         ical_uid TEXT,
+         start_utc TEXT, end_utc TEXT,  -- `YYYY-MM-DDTHH:MM:SSZ`, comparable as text
+         is_cancelled INTEGER NOT NULL DEFAULT 0,
+         meeting_thread_id TEXT,        -- Teams `19:meeting_…@thread.v2`, from onlineMeeting.joinUrl
+         subject TEXT,
+         raw TEXT NOT NULL,             -- full GET JSON verbatim; an occurrence's delta item
+         version TEXT,                  -- changeKey (else lastModifiedDateTime) `raw` was fetched for
+         search_text TEXT,              -- location, organizer, attendees, body text
+         first_seen_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL,
+         deleted_at TEXT
+       )""",
+    "CREATE INDEX events_start ON events(start_utc)",
+    "CREATE INDEX events_master ON events(series_master_id)",
+    """CREATE VIRTUAL TABLE events_fts USING fts5(subject, search_text,
+         content='events', tokenize='unicode61 remove_diacritics 2')""",
+    """CREATE TRIGGER events_fts_insert AFTER INSERT ON events BEGIN
+         INSERT INTO events_fts (rowid, subject, search_text)
+         VALUES (new.rowid, new.subject, new.search_text);
+       END""",
+    """CREATE TRIGGER events_fts_delete AFTER DELETE ON events BEGIN
+         INSERT INTO events_fts (events_fts, rowid, subject, search_text)
+         VALUES ('delete', old.rowid, old.subject, old.search_text);
+       END""",
+    """CREATE TRIGGER events_fts_update AFTER UPDATE OF subject, search_text ON events BEGIN
+         INSERT INTO events_fts (events_fts, rowid, subject, search_text)
+         VALUES ('delete', old.rowid, old.subject, old.search_text);
+         INSERT INTO events_fts (rowid, subject, search_text)
+         VALUES (new.rowid, new.subject, new.search_text);
+       END""",
+)
+
+
 def _has_message_count(db: sqlite3.Connection) -> bool:
     return "message_count" in {row["name"] for row in db.execute("PRAGMA table_info(folders)")}
 
@@ -94,8 +136,12 @@ def _has_fts(db: sqlite3.Connection) -> bool:
     return db.execute("SELECT 1 FROM sqlite_master WHERE name='messages_fts'").fetchone() is not None
 
 
+def _has_calendar(db: sqlite3.Connection) -> bool:
+    return db.execute("SELECT 1 FROM sqlite_master WHERE name='events_fts'").fetchone() is not None
+
+
 def needs_migration(db: sqlite3.Connection) -> bool:
-    return not (_has_message_count(db) and _has_fts(db))
+    return not (_has_message_count(db) and _has_fts(db) and _has_calendar(db))
 
 
 def _migrate(db: sqlite3.Connection) -> None:
@@ -110,6 +156,9 @@ def _migrate(db: sqlite3.Connection) -> None:
         if not _has_fts(db):
             for statement in _FTS:
                 db.execute(statement)
+        if not _has_calendar(db):
+            for statement in _CALENDAR:
+                db.execute(statement)
         db.commit()
     except BaseException:
         db.rollback()
@@ -119,6 +168,8 @@ def _migrate(db: sqlite3.Connection) -> None:
 def rebuild_fts(db: sqlite3.Connection) -> None:
     with db:
         db.execute(_FTS[-1])
+        # `events` has no INTEGER PRIMARY KEY either: a VACUUM may renumber its rowids too.
+        db.execute("INSERT INTO events_fts (events_fts) VALUES ('rebuild')")
 
 
 def open_readonly(data_dir: Path) -> sqlite3.Connection:

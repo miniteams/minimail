@@ -550,3 +550,94 @@ def test_a_failing_reconcile_skips_its_folder_or_retries_the_cycle(
         assert lists == ["list:INBOX", "list:F2", "list:F3"]
     else:  # F2 listed again once the failure clears (at 160), not counted as reconciled
         assert [t for t, e in _calls(fake, "list:F2")][-1] >= 160
+
+
+class CalLive(LiveGraph):
+    """LiveGraph plus a calendar: `cal_pages` pages per round, each costing `cal_cost` seconds."""
+
+    def __init__(self, clock: Clock) -> None:
+        super().__init__(clock)
+        self.cal_pages = 1
+        self.cal_cost = 0.0
+        self.cal_fail: int | str | None = None
+        self.cal_items: list[dict[str, Any]] = []
+
+    def __call__(self, req: httpx.Request) -> httpx.Response:
+        path = req.url.path.removeprefix("/v1.0/")
+        if path != "me/calendarView/delta" or self.broken:
+            return super().__call__(req)
+        page = int(req.url.params.get("page", "0"))
+        self.events.append((self.clock.now, f"cal:{page}"))
+        self.clock.now += self.cal_cost
+        if self.cal_fail == "non_json":
+            return httpx.Response(200, text="<html>maintenance</html>")
+        if isinstance(self.cal_fail, int):
+            return httpx.Response(self.cal_fail)
+        body: dict[str, Any] = {"value": self.cal_items}
+        if page + 1 < self.cal_pages:
+            body["@odata.nextLink"] = f"{BASE}/{path}?page={page + 1}"
+        else:
+            body["@odata.deltaLink"] = f"{BASE}/{path}?deltatoken=t"
+        return httpx.Response(200, json=body)
+
+
+def test_calendar_follows_every_inbox_round(db: sqlite3.Connection, pool: ThreadPoolExecutor) -> None:
+    """001-AC16 (cadence): the calendar is checked right after every Inbox round, 30 s apart."""
+    clock = Clock()
+    fake = CalLive(clock)
+    fake.cal_items = [{"id": "o1", "type": "occurrence", "seriesMasterId": "m"}]
+    with capture_logs() as logs:
+        run_live(
+            make_graph(fake), db, pool, CADENCE, wait=waiter(clock, [], lambda: clock() >= 60), clock=clock
+        )
+    rounds = [e for e in fake.events if e[1].startswith(("INBOX", "cal"))]
+    assert rounds == [(t, e) for t in (0.0, 30.0, 60.0) for e in ("INBOX:0", "cal:0")]
+    assert [e["listed"] for e in logs if e["event"] == "calendar_synced"] == [1, 1, 1]
+
+
+def test_a_long_calendar_round_yields_to_the_inbox(db: sqlite3.Connection, pool: ThreadPoolExecutor) -> None:
+    """001-AC4: a calendar backfill stops between pages once the Inbox is due, then resumes."""
+    clock = Clock()
+    fake = CalLive(clock)
+    fake.cal_pages, fake.cal_cost = 3, 20.0
+    run_live(make_graph(fake), db, pool, CADENCE, wait=waiter(clock, [], lambda: clock() >= 60), clock=clock)
+    rounds = [e for e in fake.events if e[1].startswith(("INBOX", "cal"))]
+    assert rounds[:5] == [(0, "INBOX:0"), (0, "cal:0"), (20, "cal:1"), (40, "INBOX:0"), (40, "cal:2")]
+
+
+@pytest.mark.parametrize("status", [500, 403, 404, "non_json"])
+def test_a_failing_calendar_is_logged_and_isolated(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, status: int | str
+) -> None:
+    """The calendar fails on its own like a folder: logged, the Inbox and other folders go on, retried
+    next Inbox round."""
+    clock = Clock()
+    fake = CalLive(clock)
+    fake.cal_fail = status
+    with capture_logs() as logs:
+        run_live(
+            make_graph(fake), db, pool, CADENCE, wait=waiter(clock, [], lambda: clock() >= 30), clock=clock
+        )
+    failed = [e for e in logs if e["event"] == "calendar_round_failed"]
+    assert len(failed) == 2 and failed[0]["status"] == (None if status == "non_json" else status)
+    assert [e for _, e in fake.events if e.startswith(("INBOX", "F2", "cal"))][:4] == [
+        "INBOX:0",
+        "cal:0",
+        "F2:0",
+        "INBOX:0",
+    ]
+    assert not [e for e in logs if e["event"] == "live_cycle_failed"]
+
+
+@pytest.mark.parametrize("status", [401, 429])
+def test_a_mailbox_wide_calendar_failure_backs_off_the_cycle(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, status: int
+) -> None:
+    clock = Clock()
+    fake = CalLive(clock)
+    fake.cal_fail = status
+    with capture_logs() as logs:
+        run_live(
+            make_graph(fake), db, pool, CADENCE, wait=waiter(clock, [], lambda: clock() >= 30), clock=clock
+        )
+    assert [e["event"] for e in logs if e["event"] == "live_cycle_failed"]

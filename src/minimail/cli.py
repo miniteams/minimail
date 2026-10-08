@@ -13,21 +13,31 @@ from collections.abc import Callable, Iterator, Sequence
 from compression import zstd
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, suppress
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import httpx
 import structlog
 from pydantic import ValidationError
 
-from . import __version__
+from . import __version__, calendar
 from .auth import AuthExpired, AuthUnavailable, TokenSource
 from .config import Settings
 from .folders import sync_folders
 from .graph import Graph
 from .live import FOLDER_ERRORS, Cadence, folder_failed, run_live, sync_pass
 from .logging import setup_logging
-from .mail import DOWNLOAD_WORKERS, Reconciled, local_counts, path_id, reconcile_folder, retry_failed
-from .mime import Attachment, attachments, body_text, extract, header, parse
+from .mail import (
+    DOWNLOAD_WORKERS,
+    Reconciled,
+    _address,
+    local_counts,
+    path_id,
+    reconcile_folder,
+    retry_failed,
+)
+from .mime import Attachment, attachments, body_text, extract, header, html_to_text, parse
 from .search import resolve, search, short_id
 from .store import needs_migration, open_db, open_readonly, rebuild_fts
 
@@ -117,6 +127,8 @@ def cmd_sync(settings: Settings, db: sqlite3.Connection, args: argparse.Namespac
         else:
             total = sync_pass(graph, db, executor, selected)
             log.info("sync_done", folders=len(selected), **vars(total))
+            if not args.folder:
+                log.info("calendar_synced", **vars(calendar.sync_calendar(graph, db, executor)))
         clean = True
     finally:
         # Close first: it wakes workers asleep in a back-off or a pacing slot, so exit is prompt.
@@ -143,7 +155,7 @@ def cmd_reconcile(settings: Settings, db: sqlite3.Connection, args: argparse.Nam
             try:
                 c = reconcile_folder(graph, db, folder["id"])
             except FOLDER_ERRORS as exc:
-                folder_failed(exc, folder, "folder_reconcile_failed")
+                folder_failed(exc, folder["path"], "folder_reconcile_failed")
                 failed += 1
                 continue
             log.info("folder_reconciled", path=folder["path"], **c.summary())
@@ -198,8 +210,11 @@ def cmd_reindex(settings: Settings, db: sqlite3.Connection, args: argparse.Names
     done = 0
     with closing(reader):
         for row in reader.execute("SELECT id, mime FROM messages WHERE mime IS NOT NULL"):
-            text = extract(zstd.decompress(row["mime"])).text
-            db.execute("UPDATE messages SET search_text=? WHERE id=?", (text, row["id"]))
+            found = extract(zstd.decompress(row["mime"]))
+            db.execute(
+                "UPDATE messages SET search_text=?, ical_uid=? WHERE id=?",
+                (found.text, found.ical_uid, row["id"]),
+            )
             done += 1
             if done % 500 == 0:
                 db.commit()
@@ -208,7 +223,28 @@ def cmd_reindex(settings: Settings, db: sqlite3.Connection, args: argparse.Names
     return 0
 
 
+def _local(stamp: str | None) -> str:
+    return datetime.fromisoformat(stamp).astimezone().strftime("%a %Y-%m-%d %H:%M") if stamp else "?"
+
+
+def _search_events(db: sqlite3.Connection, args: argparse.Namespace) -> int:
+    if args.folder:
+        print("minimail: --folder does not apply to --events", file=sys.stderr)
+        return 2
+    for row in calendar.search_events(db, args.query, args.limit, args.deleted):
+        hit = {**dict(row), "short_id": short_id(row["id"]), "snippet": " ".join(row["snippet"].split())}
+        if args.json:
+            print(json.dumps(hit))  # ASCII: C1 controls and bidi overrides leave \u-escaped
+            continue
+        gone = "  (deleted)" if row["deleted_at"] else ""
+        _say(f"{hit['short_id']}  {_local(row['start_utc'])}  {_one_line(row['subject'])}{gone}")
+        _say(f"    {hit['snippet']}")
+    return 0
+
+
 def cmd_search(settings: Settings, db: sqlite3.Connection, args: argparse.Namespace) -> int:
+    if args.events:
+        return _search_events(db, args)
     if args.folder and not db.execute("SELECT 1 FROM folders WHERE path=?", (args.folder,)).fetchone():
         print(f"minimail: unknown folder {args.folder!r}", file=sys.stderr)
         return 2
@@ -278,6 +314,103 @@ def cmd_show(settings: Settings, db: sqlite3.Connection, args: argparse.Namespac
         _say(f"Attachment: {name} ({_one_line(att.content_type)}, {len(att.data)} bytes)")
     print()
     _say(body)
+    return 0
+
+
+def _span(row: sqlite3.Row, data: dict[str, Any]) -> tuple[str, str]:
+    """Start and end as shown; an all-day event's are its first and last days, never shifted."""
+    if not data.get("isAllDay") or not row["start_utc"] or not row["end_utc"]:
+        return _local(row["start_utc"]), _local(row["end_utc"])
+    first = date.fromisoformat(row["start_utc"][:10])
+    last = max(first, date.fromisoformat(row["end_utc"][:10]) - timedelta(1))
+    return first.strftime("%a %Y-%m-%d"), last.strftime("%a %Y-%m-%d")
+
+
+def _summary(row: sqlite3.Row, data: dict[str, Any]) -> dict[str, Any]:
+    thread = calendar.meeting_thread_id(data)
+    start, end = _span(row, data)
+    return {
+        "id": row["id"],
+        "short_id": short_id(row["id"]),
+        "type": row["type"],
+        "all_day": bool(data.get("isAllDay")),
+        "start": start,
+        "end": end,
+        "subject": data.get("subject") or "",
+        "organizer": _address(data.get("organizer")),
+        "location": (data.get("location") or {}).get("displayName") or "",
+        # The new short Teams links (`/meet/…`) carry no thread id, hence the provider too.
+        "teams": thread is not None or data.get("onlineMeetingProvider") == "teamsForBusiness",
+        "meeting_thread_id": thread,
+    }
+
+
+def _when(hit: dict[str, Any]) -> str:
+    if hit["all_day"]:
+        return f"{hit['start']}{'' if hit['end'] == hit['start'] else ' – ' + hit['end']} (all day)"
+    until = hit["end"].rsplit(" ", 1)[1] if hit["end"][:14] == hit["start"][:14] else hit["end"]
+    return f"{hit['start']}–{until}"
+
+
+def cmd_agenda(settings: Settings, db: sqlite3.Connection, args: argparse.Namespace) -> int:
+    first = args.since or date.today()
+    for row, data in calendar.agenda(db, first, args.until or first + timedelta(days=7)):
+        hit = _summary(row, data)
+        if args.json:
+            print(json.dumps(hit))
+            continue
+        line = f"{hit['short_id']}  {_when(hit)}  {_one_line(hit['subject'])}"
+        if hit["organizer"]:
+            line += f"  ({_one_line(hit['organizer'])})"
+        if hit["location"]:
+            line += f"  @ {_one_line(hit['location'])}"
+        _say(line + ("  [Teams]" if hit["teams"] else ""))
+    return 0
+
+
+def cmd_event(settings: Settings, db: sqlite3.Connection, args: argparse.Namespace) -> int:
+    try:
+        event_id = resolve(db, args.id, "events")
+    except LookupError as exc:
+        print(f"minimail: {exc.args[0]}", file=sys.stderr)
+        return 2
+    row = calendar.event(db, event_id)
+    data = calendar.details(row)
+    found = {
+        **_summary(row, data),
+        # The column, not the JSON: a refused GET leaves the JSON older than the delta item's state.
+        "cancelled": bool(row["is_cancelled"]),
+        "deleted_at": row["deleted_at"],
+        "ical_uid": data.get("iCalUId"),
+        "attendees": [_address(a) for a in data.get("attendees") or []],
+        "mails": [{**dict(m), "short_id": short_id(m["id"])} for m in calendar.linked_mails(db, data)],
+    }
+    if args.json:
+        print(json.dumps(found))
+        return 0
+    _say(f"Subject: {_one_line(found['subject'])}")
+    _say(f"When: {_when(found)}")
+    for label, key in (("Type", "type"), ("Organizer", "organizer"), ("Location", "location")):
+        if found[key]:
+            _say(f"{label}: {_one_line(found[key])}")
+    if found["attendees"]:
+        _say(f"Attendees: {', '.join(map(_one_line, found['attendees']))}")
+    if found["cancelled"]:
+        _say("Cancelled: yes")
+    if found["deleted_at"]:
+        _say(f"Deleted: {_one_line(found['deleted_at'])}")
+    if found["meeting_thread_id"]:
+        _say(f"Teams meeting chat: {_one_line(found['meeting_thread_id'])}")
+    if found["ical_uid"]:
+        _say(f"iCalUId: {_one_line(found['ical_uid'])}")
+    for mail in found["mails"]:
+        who = "  ".join(_one_line(mail[k] or "") for k in ("received_at", "subject"))
+        _say(f"Mail: {mail['short_id']}  {who}{'  (deleted)' if mail['deleted_at'] else ''}")
+    _say(f"Id: {_one_line(row['id'])}")
+    body = data.get("body") or {}
+    text = body.get("content") or ""
+    print()
+    _say(html_to_text(text) if (body.get("contentType") or "").lower() == "html" else text)
     return 0
 
 
@@ -379,6 +512,18 @@ def _parser() -> argparse.ArgumentParser:
     search_p.add_argument("--limit", type=int, default=20, metavar="N", help="at most N hits (default 20)")
     search_p.add_argument("--deleted", action="store_true", help="include messages deleted on the server")
     search_p.add_argument("--json", action="store_true", help="one JSON object per line")
+    search_p.add_argument("--events", action="store_true", help="search calendar events instead of mail")
+    agenda_p = sub.add_parser("agenda", help="calendar events overlapping a period, local time")
+    agenda_p.add_argument(
+        "--from", dest="since", type=date.fromisoformat, metavar="DATE", help="first day (default today)"
+    )
+    agenda_p.add_argument(
+        "--to", dest="until", type=date.fromisoformat, metavar="DATE", help="last day (default first + 7)"
+    )
+    agenda_p.add_argument("--json", action="store_true", help="one JSON object per line")
+    event_p = sub.add_parser("event", help="an event's details, linked mails and Teams meeting chat id")
+    event_p.add_argument("id", help="event id, or a unique prefix of it or of its short id")
+    event_p.add_argument("--json", action="store_true", help="one JSON object")
     show = sub.add_parser("show", help="headers, flags, attachment list and text of a message")
     show.add_argument("id", help="message id, or a unique prefix of it or of its short id")
     show.add_argument("--raw", action="store_true", help="write the verbatim MIME to stdout")
@@ -389,7 +534,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 # Read-only commands never create, chmod or migrate the archive, and never take its write lock.
-READERS = frozenset({"search", "show", "attachments"})
+READERS = frozenset({"search", "show", "attachments", "agenda", "event"})
 
 COMMANDS: dict[str, Callable[[Settings, sqlite3.Connection, argparse.Namespace], int]] = {
     "folders": cmd_folders,
@@ -400,6 +545,8 @@ COMMANDS: dict[str, Callable[[Settings, sqlite3.Connection, argparse.Namespace],
     "search": cmd_search,
     "show": cmd_show,
     "attachments": cmd_attachments,
+    "agenda": cmd_agenda,
+    "event": cmd_event,
 }
 
 

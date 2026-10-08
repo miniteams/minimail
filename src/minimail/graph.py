@@ -23,6 +23,10 @@ _MAX_BACKOFF = 60.0
 PAGE_SIZE = 100
 
 
+def prefer(page_size: int) -> str:
+    return f'IdType="ImmutableId", odata.maxpagesize={page_size}'
+
+
 class Tokens(Protocol):
     def token(self, force_refresh: bool = False) -> str: ...
 
@@ -58,7 +62,7 @@ class Graph:
             # Per socket read, so large $value bodies are unaffected; bounds how long close() waits.
             timeout=httpx.Timeout(30.0, connect=10.0),
             transport=transport,
-            headers={"Prefer": f'IdType="ImmutableId", odata.maxpagesize={PAGE_SIZE}'},
+            headers={"Prefer": prefer(PAGE_SIZE)},
         )
 
     def close(self) -> None:
@@ -117,16 +121,19 @@ class Graph:
             resp.raise_for_status()
             return resp
 
-    def get(self, path: str, **params: Any) -> dict[str, Any]:
-        data: dict[str, Any] = self.request("GET", path, params=params or None).json()
+    def get(self, path: str, *, prefer: str | None = None, **params: Any) -> dict[str, Any]:
+        """`prefer` replaces the client's default Prefer header for this request."""
+        headers = {"Prefer": prefer} if prefer else {}
+        data: dict[str, Any] = self.request("GET", path, params=params or None, headers=headers).json()
         return data
 
-    def pages(self, path: str, **params: Any) -> Iterator[dict[str, Any]]:
-        """Each page of a collection, following @odata.nextLink (which already embeds the query)."""
-        page = self.get(path, **params)
+    def pages(self, path: str, *, prefer: str | None = None, **params: Any) -> Iterator[dict[str, Any]]:
+        """Each page of a collection, following @odata.nextLink (which already embeds the query);
+        `prefer` goes with every page (a Prefer is per request)."""
+        page = self.get(path, prefer=prefer, **params)
         yield page
         while next_link := page.get("@odata.nextLink"):
-            page = self.get(next_link)
+            page = self.get(next_link, prefer=prefer)
             yield page
 
     def items(self, path: str, **params: Any) -> Iterator[dict[str, Any]]:

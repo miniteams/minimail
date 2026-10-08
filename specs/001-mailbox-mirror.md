@@ -46,7 +46,7 @@ is lost locally.
 - Event attachments (files attached to the event itself; invitation mail attachments are covered).
 - Fetching the Teams chat/transcript itself: minimail exposes the thread id, miniteams reads it.
 - Shared/delegated mailboxes, Online Archive (In-Place Archive is not exposed by Graph).
-- Calendar, contacts, tasks.
+- Contacts, tasks.
 - Push notifications (Graph webhooks need a public HTTPS endpoint; EWS streaming is being retired).
 - A UI/widget.
 
@@ -144,13 +144,20 @@ is lost locally.
 - **DoD**: AC7/AC8 fixture tests green; attachment extraction test incl. a `../` filename.
 
 ### Phase 5 — Calendar
-- Work: `calendarView/delta` over the window, full GET for masters/singles/exceptions, tombstones,
-  daily window slide, `agenda`, `event`, event FTS, `iCalUId` ↔ mail link (store `iCalUId` on
-  meeting messages), `joinUrl` → thread id.
+- Work: `calendarView/delta` over [2000-01-01, now + 2 years] (`sync_state` key `calendar`, resumable,
+  resync on 410/`syncStateNotFound`), full `GET me/events/{id}` for masters/singles/exceptions, kept
+  verbatim and refetched only when the item's `changeKey` (else `lastModifiedDateTime`) moved;
+  occurrences keep their delta item; `@removed` → tombstone; daily window slide; `agenda`, `event`,
+  `search --events` (FTS); the UID of a mail's `text/calendar` part stored on the message at sync
+  and by `reindex` (`iCalUId`/`uid` ↔ mail link); `joinUrl` → thread id; in `--live`, a calendar
+  round after every Inbox round, isolated and yielding to the Inbox like the other folders; one-shot
+  `sync` without `--folder` includes it.
 - **Covers**: AC14, AC15, AC16, AC17, AC18, AC19
 - **Data model impact**: `events` (id, type, series_master_id, ical_uid, start_utc, end_utc,
-  is_cancelled, meeting_thread_id, raw JSON, search_text, deleted_at), `events_fts`, `messages.ical_uid`,
-  `sync_state` row for the calendar (window bounds + delta link)
+  is_cancelled, meeting_thread_id, subject, raw JSON, version, search_text, first_seen_at,
+  updated_at, deleted_at), `events_fts` (external content: subject, search_text) + triggers,
+  `messages.ical_uid`, `sync_state.window_end` (the calendar row: window end + cursors; the start is
+  fixed) — all added to existing archives in place, in one transaction
 - **DoD**: real backfill count matches AC14; live test: create/move/delete a test event → reflected
   < 60 s; `agenda` for a week with a recurring meeting and an exception matches Outlook; a known
   Teams meeting resolves to a thread id that miniteams `read_messages` accepts.
@@ -166,7 +173,7 @@ is lost locally.
 ## Data model impact (summary)
 
 New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ical_uid`),
-`messages_fts` (+ its triggers), `events`, `events_fts`, `sync_state`.
+`messages_fts` (+ its triggers), `events`, `events_fts` (+ its triggers), `sync_state` (+ `window_end`).
 
 ## Open questions
 
@@ -201,7 +208,43 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
 - **Calendar = `calendarView/delta` (v1.0)**, not beta `events/delta`: v1.0, and it returns exceptions
   and occurrences (beta returned masters + singles only). Its items are slim, hence the full GET.
 - **Calendar verbatim = raw Graph JSON** — Graph has no per-event iCalendar export.
-- **Window start = earliest event** (probed once with a wide window); end slides daily.
+- **Window start fixed at 2000-01-01**, before any event of this mailbox (a 2000-01-01 window was
+  measured to work): it covers "from the earliest event" with no probe round and no second backfill
+  over a narrowed window. End = now + 730 days, at day granularity, so it moves once a day.
+- **Window slide = one more round over the wider window** (AC17): when the end has moved, the round
+  first finishes the old window's delta (no change lost), then lists [2000-01-01, new end] afresh
+  and keeps that round's cursor. The listing re-reads every item (pages only), but a master, single or
+  exception whose `changeKey` is unchanged costs no `GET`: only events entering the future edge (or
+  changed) are fetched. A round per extra slice instead would leave one delta cursor per day to poll
+  forever. A pause between the two halves redoes the old delta (idempotent). Relies on a fresh
+  round's token reporting what changes while it is listed (live check).
+- **Refetch rule**: the delta item's `changeKey` (else `lastModifiedDateTime`; measured on every
+  master, single and exception, never on occurrences) is stored beside the full JSON it was fetched
+  for. A full `GET` answering a permanent status (mail's set: 400, 403, 404, 406, 410, 413, 415, 422)
+  is logged (`event_fetch_failed`) and does not stop the round: a new event keeps its delta item,
+  an archived one keeps its full JSON; either way with no version, so the next listing fetches it
+  again (a deletion arrives as `@removed`). Throttling, auth and 5xx left after retries stop the round
+  before its cursor moves.
+- **Unchanged re-listing writes nothing**: a row is rewritten only if its JSON or version changed or it
+  was a tombstone, so occurrences re-listed every round cause no index churn.
+- **Occurrences are shown through their master**: their delta item is slim, so `agenda`/`event` read
+  an occurrence's JSON over its master's (subject, organizer, location, join URL); `search --events`
+  leaves occurrences out (each would repeat its master's text); `agenda` leaves masters out (each
+  would repeat its first occurrence) and drops occurrences of a cancelled or deleted master.
+- **Event ↔ mail = the `text/calendar` part's UID** (unfolded `UID` line), matched against the
+  event's `iCalUId` and its series-wide `uid` (Graph's `iCalUId` differs per occurrence; an
+  invitation to a series carries the series UID). Equality of the ICS UID and Graph's ids: live check.
+- **Times are UTC as Graph sends them** (no `Prefer: outlook.timezone`): stored `YYYY-MM-DDTHH:MM:SSZ`,
+  shown in the machine's local time; any other `timeZone` fails the calendar round loudly rather than
+  storing a wrong time. All-day events are floating (Graph: midnight to midnight UTC, measured): they
+  overlap a period by their dates and are shown as dates, never shifted to local time.
+- **Teams flag** = a thread id in the join URL or `onlineMeetingProvider = teamsForBusiness` (the short
+  `teams.microsoft.com/meet/…` links carry no thread id).
+- **Calendar in `--live`**: a round right after every Inbox round, with the Inbox's own pause test
+  between pages (a page = up to 100 full `GET`s on the download pool, the same unit as a mail page),
+  so the AC4 bound holds; a calendar failing on its own is logged and retried at the next Inbox
+  round, mailbox-wide errors fail the cycle. While its first backfill runs, it uses each interval
+  and the other folders wait for it to finish.
 - **Bounded memory**: `--live` runs forever; any per-message cache is LRU-bounded.
 - **AC1 counts messages, not items**: `totalItemCount` also counts the non-mail items a folder holds
   (Deleted Items keeps deleted events, contacts and tasks), which `messages/delta` never lists; the
@@ -232,7 +275,8 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
   the walk is retried one tree interval later.
 - **Reconcile beside delta**: Graph's message delta never reports a message leaving Deleted Items by a
   delete (soft delete into Recoverable Items): the cursor moves past it with no `@removed`. So a
-  reconcile lists each folder's ids (`messages?$select=id`) and sends every live local id the server
+  reconcile lists each folder's ids (`messages?$select=id`, 1000 per page with a per-request
+  `Prefer: odata.maxpagesize=1000`: listing is latency-bound, ~490 sequential pages for 49k ids at 100) and sends every live local id the server
   no longer lists through the `@removed` logic (404 or hidden parent → tombstone, visible folder →
   move); a lookup also clears a false hit (a message stored after the listing). A local tombstone the
   server still lists in that folder (lookup confirms the parent) is revived: a false tombstone (a

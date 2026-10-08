@@ -20,7 +20,7 @@ import httpx
 import structlog
 
 from .auth import AuthExpired, AuthUnavailable
-from .graph import PAGE_SIZE, Graph
+from .graph import PAGE_SIZE, Graph, prefer
 from .mime import Extracted, extract
 
 log = structlog.get_logger()
@@ -30,9 +30,11 @@ SELECT = (
     "sentDateTime,isRead,flag,categories,conversationId,hasAttachments,importance,isDraft,lastModifiedDateTime"
 )
 # 4xx about the item itself; 401/408/429 are about the session or the moment.
-_PERMANENT = frozenset({400, 403, 404, 406, 410, 413, 415, 422})
+PERMANENT = frozenset({400, 403, 404, 406, 410, 413, 415, 422})
 # Graph allows 4 concurrent requests per mailbox per app; more only buys 429s.
 DOWNLOAD_WORKERS = 4
+# Listing ids is latency-bound: 10× fewer sequential pages than the client's default page size.
+LIST_PAGE_SIZE = 1000
 # Delta cursors Graph no longer honours: start the round over (stored MIME is not refetched).
 _RESYNC_CODES = frozenset(
     {"syncStateNotFound", "resyncRequired", "SyncStateNotFound", "ErrorInvalidSyncState"}
@@ -67,6 +69,7 @@ class Stored:
     text: str | None = None
     error: str | None = None
     gone: bool = False
+    ical_uid: str | None = None
 
 
 def _now() -> str:
@@ -92,7 +95,7 @@ def fetch_mime(graph: Graph, msg_id: str) -> Stored:
     except httpx.HTTPStatusError as exc:
         # Only a verdict on the item itself is final; throttling, auth and 5xx left after the
         # client's own retries stop the round so a later one fetches it.
-        if exc.response.status_code not in _PERMANENT:
+        if exc.response.status_code not in PERMANENT:
             raise
         if exc.response.status_code == 404 and _missing(graph, msg_id):
             # Not a message (Deleted Items' delta lists items /messages does not) or deleted since
@@ -100,10 +103,17 @@ def fetch_mime(graph: Graph, msg_id: str) -> Stored:
             return Stored(msg_id, gone=True)
         return Stored(msg_id, error=f"http {exc.response.status_code}")
     try:
-        text = extract(raw).text
+        found = extract(raw)
     except Exception:  # noqa: BLE001 — unparseable MIME is still archived verbatim
-        text = Extracted().text
-    return Stored(msg_id, zstd.compress(raw), hashlib.sha256(raw).hexdigest(), len(raw), text)
+        found = Extracted()
+    return Stored(
+        msg_id,
+        zstd.compress(raw),
+        hashlib.sha256(raw).hexdigest(),
+        len(raw),
+        found.text,
+        ical_uid=found.ical_uid,
+    )
 
 
 def _missing(graph: Graph, msg_id: str) -> bool:
@@ -196,9 +206,9 @@ def _store_downloads(
         with db:
             db.execute(
                 """UPDATE messages SET mime=?, mime_sha256=?, mime_size=?, mime_error=?, search_text=?,
-                     deleted_at=CASE WHEN ? THEN COALESCE(deleted_at, ?) ELSE deleted_at END
+                     ical_uid=?, deleted_at=CASE WHEN ? THEN COALESCE(deleted_at, ?) ELSE deleted_at END
                    WHERE id=?""",
-                (s.blob, s.sha256, s.size, s.error, s.text, s.gone, _now(), s.id),
+                (s.blob, s.sha256, s.size, s.error, s.text, s.ical_uid, s.gone, _now(), s.id),
             )
         if s.gone:
             # No mime_error: a relisted item is fetched (and tombstoned) again, never left live.
@@ -352,7 +362,11 @@ def reconcile_steps(graph: Graph, db: sqlite3.Connection, folder_id: str, c: Rec
     page, up to a page of lookups) so a caller can pause between them. Delta never reports a soft
     delete out of Deleted Items: a local id the server no longer lists goes through `_handle_removed`."""
     server: set[str] = set()
-    for page in graph.pages(f"me/mailFolders/{path_id(folder_id)}/messages", **{"$select": "id"}):
+    for page in graph.pages(
+        f"me/mailFolders/{path_id(folder_id)}/messages",
+        prefer=prefer(LIST_PAGE_SIZE),
+        **{"$select": "id", "$top": LIST_PAGE_SIZE},
+    ):
         server.update(i["id"] for i in page.get("value", []))
         yield
     c.listed = len(server)

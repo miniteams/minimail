@@ -6,6 +6,7 @@ still be archived and searchable on whatever could be read.
 
 import email
 import email.policy
+import re
 from dataclasses import dataclass, field
 from email.message import EmailMessage, Message
 from html.parser import HTMLParser
@@ -91,6 +92,7 @@ class Extracted:
     recipients: str = ""
     text: str = ""
     attachments: list[str] = field(default_factory=list)
+    ical_uid: str | None = None
 
 
 def body_text(msg: EmailMessage) -> str:
@@ -180,6 +182,20 @@ def _leaves(msg: Message) -> list[Message]:
     return leaves
 
 
+# RFC 5545 §3.1: a line break followed by one space or tab continues the previous line.
+_FOLD = re.compile(r"\r?\n[ \t]")
+_UID = re.compile(r"^UID(?:;[^:\r\n]*)?:(.+?)\r?$", re.MULTILINE | re.IGNORECASE)
+
+
+def calendar_uid(msg: Message) -> str | None:
+    """UID of the message's own text/calendar part (meeting invitations and responses)."""
+    for part in _leaves(msg):
+        if part.get_content_type() == "text/calendar":
+            if found := _UID.search(_FOLD.sub("", part_text(part))):
+                return found.group(1).strip()
+    return None
+
+
 def extract(raw: bytes) -> Extracted:
     try:
         msg = parse(raw)
@@ -187,8 +203,10 @@ def extract(raw: bytes) -> Extracted:
         return Extracted()
     out: list[str] = []
     attachments: list[str] = []
+    ical_uid = None
     try:
         _body_text(msg, out, attachments, 0)
+        ical_uid = calendar_uid(msg)
     except Exception:  # noqa: BLE001 — keep whatever headers we have; the raw MIME stays intact
         pass
     recipients = ", ".join(h for h in (header(msg, n) for n in ("to", "cc", "bcc")) if h)
@@ -199,4 +217,5 @@ def extract(raw: bytes) -> Extracted:
         recipients=recipients,
         text=text[:MAX_TEXT],
         attachments=attachments,
+        ical_uid=ical_uid,
     )

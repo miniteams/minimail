@@ -45,6 +45,7 @@ class FakeGraph:
         self.pages = pages
         self.value_calls: Counter[str] = Counter()
         self.urls: list[str] = []
+        self.requests: list[httpx.Request] = []
         self.fail_value: dict[str, int] = {}  # id → HTTP status
         self.break_value: set[str] = set()  # ids whose download dies on the wire
         self.raise_value: dict[str, Exception] = {}  # ids whose download raises this
@@ -56,7 +57,10 @@ class FakeGraph:
     def __call__(self, req: httpx.Request) -> httpx.Response:
         url = str(req.url)
         self.urls.append(url)
+        self.requests.append(req)
         path = req.url.path.removeprefix("/v1.0/")
+        if path == "me/calendarView/delta":
+            return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{BASE}/{path}?deltatoken=c"})
         if path.endswith("/$value"):
             msg_id = path.split("/")[2]
             self.value_calls[msg_id] += 1
@@ -429,6 +433,20 @@ def test_reconcile_yields_after_each_page_and_each_chunk_of_lookups(
     marks = [len(fake.urls) - base for _ in mail.reconcile_steps(graph, db, FOLDER, mail.Reconciled())]
     assert marks == [1, 2, 3, 5]
     assert len(fake.urls) - base == 6 and local_counts(db) == {}
+
+
+def test_reconcile_lists_ids_in_pages_of_1000_with_immutable_ids(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """Listing is latency-bound: every listing page asks for 1000 ids, still as immutable ids."""
+    fake = FakeGraph([[]])
+    fake.listing = {FOLDER: ["m1", "m2", "m3"]}
+    mail.reconcile_folder(make_graph(fake), db, FOLDER)
+    listing = [r for r in fake.requests if r.url.path.endswith(f"/mailFolders/{FOLDER}/messages")]
+    assert len(listing) == 2
+    assert listing[0].url.params["$top"] == "1000"
+    for req in listing:
+        assert req.headers["Prefer"] == 'IdType="ImmutableId", odata.maxpagesize=1000'
 
 
 def test_reconcile_revives_a_tombstone_the_server_still_lists(
