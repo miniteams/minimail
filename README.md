@@ -17,7 +17,10 @@ Sign-in is miniteams' (`miniteams login`): minimail only reads tokens from its M
 
 | Command | Does |
 |---|---|
-| `uv run minimail folders` | Sync the folder tree; print each folder's server item count and path |
+| `uv run minimail folders` | Sync the folder tree; print server vs local item counts per folder |
+| `uv run minimail sync [--folder PATH]… [--retry-failed]` | Mirror messages (verbatim MIME + metadata). First run = full backfill, then incremental; resumes after a crash |
+| `uv run minimail verify [--refetch N]` | Check every stored MIME against its sha256; `--refetch N` compares N random messages to the server byte for byte |
+| `uv run minimail reindex` | Recompute search text from stored MIME, no download (stop `sync` first: single writer) |
 
 ## Configuration (`MINIMAIL_*`, env or `.env`)
 
@@ -28,6 +31,7 @@ Sign-in is miniteams' (`miniteams login`): minimail only reads tokens from its M
 | `MINIMAIL_MSAL_CACHE` | `~/.config/miniteams/msal_cache.json` | Token cache shared with miniteams |
 | `MINIMAIL_LOG_LEVEL` | `INFO` | Logs go to stderr (JSON when not a TTY) |
 
-Exit codes: `2` no usable token or missing setting, `3` sign-in service unavailable (retry), `1` Graph error.
+Exit codes: `2` no usable token, missing setting or unknown `--folder`, `3` sign-in service unavailable
+(retry), `1` Graph error or `verify` mismatch.
 
 The archive is personal data: its directory is `0700`, its files `0600`. Never commit `data/`.

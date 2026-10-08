@@ -102,11 +102,14 @@ is lost locally.
   missing-token exit green; `pre-commit run --all-files` clean.
 
 ### Phase 2 — Backfill: verbatim MIME + metadata + search text
-- Work: per-folder listing, `$value` download, zstd-compressed blob + sha256, metadata JSON, MIME →
-  `search_text` extraction (charsets, QP/base64, RFC 2047, HTML → text), resumable, `minimail verify`.
+- Work: per-folder delta round (the first round is the backfill), `$value` download, zstd-compressed
+  blob + sha256, metadata JSON, MIME → `search_text` extraction (charsets, QP/base64, RFC 2047,
+  HTML → text), resumable, `minimail verify`, `minimail reindex` (re-extract from stored MIME),
+  `sync --retry-failed`.
 - **Covers**: AC1, AC2, AC3
 - **Data model impact**: `messages` (id, internet_message_id, folder_id, received_at, meta JSON,
-  mime BLOB, mime_sha256, mime_size, search_text, deleted_at)
+  mime BLOB, mime_sha256, mime_size, mime_error, search_text, deleted_at), `sync_state` (key,
+  next_link, delta_link, updated_at)
 - **DoD**: full backfill of the real mailbox; AC1 counts match; `verify` reports 0 mismatches;
   extraction tests on a fixture corpus (QP, base64, latin-1, cp1252, HTML-only) green.
 
@@ -114,7 +117,7 @@ is lost locally.
 - Work: per-folder message delta + folder delta, tombstones, moves, metadata-only updates, cadence
   loop (30 s / 5 min / 15 min), clean stop on SIGINT/SIGTERM.
 - **Covers**: AC4, AC5, AC6
-- **Data model impact**: `sync_state` (folder_id, delta_link, last_run_at)
+- **Data model impact**: none (`sync_state` arrives in phase 2)
 - **DoD**: live test: send self a mail → searchable < 60 s; delete/move/flag one → reflected without a
   MIME refetch (log shows no `$value` call).
 
@@ -163,6 +166,10 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
 - **`search_text` is a dedicated decoded column**, not FTS over raw MIME — encodings would defeat it.
 - **Attachments extracted on demand** from the MIME, not stored twice.
 - **Archive semantics**: deletions are tombstones, never local deletes.
+- **Backfill = first delta round** per folder: one code path for backfill and incremental sync, one
+  resume cursor (`sync_state.next_link`); hence `sync_state` lands in phase 2.
+- **Only permanent 4xx are recorded as download failures**; throttling, auth and 5xx stop the round,
+  and every round ends by fetching any MIME still missing in the folder.
 - **Data dir** `./data` (gitignored, `MINIMAIL_DATA_DIR` overrides), like miniteams: typically a
   symlink to NAS storage. SQLite over NFS → one writer at a time, all processes on the same host.
 - **Personal data**: archive stays local (`0700`/`0600`), CLI + MCP over stdio only, no network

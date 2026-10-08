@@ -12,6 +12,30 @@ CREATE TABLE IF NOT EXISTS folders (
     total_count INTEGER NOT NULL DEFAULT 0,
     deleted_at TEXT
 );
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,                -- Graph immutable id: stable across folder moves
+    folder_id TEXT NOT NULL,
+    internet_message_id TEXT,
+    received_at TEXT,
+    subject TEXT, sender TEXT, recipients TEXT,
+    meta TEXT NOT NULL,                 -- latest Graph metadata JSON (read, flag, categories…)
+    mime BLOB,                          -- zstd of the verbatim MIME; NULL until fetched
+    mime_sha256 TEXT,                   -- of the uncompressed bytes, for `verify`
+    mime_size INTEGER,
+    mime_error TEXT,                    -- why the MIME could not be fetched
+    search_text TEXT,
+    first_seen_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    deleted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS messages_folder ON messages(folder_id);
+CREATE INDEX IF NOT EXISTS messages_received ON messages(received_at);
+CREATE TABLE IF NOT EXISTS sync_state (
+    key TEXT PRIMARY KEY,               -- `folder:<id>` (later `calendar`)
+    next_link TEXT,                     -- mid-round cursor: resume here after a crash
+    delta_link TEXT,                    -- end-of-round cursor: next incremental round
+    updated_at TEXT NOT NULL
+);
 """
 
 
