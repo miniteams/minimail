@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Iterator
 from compression import zstd
 from concurrent.futures import Executor, as_completed
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -20,8 +20,9 @@ import httpx
 import structlog
 
 from .auth import AuthExpired, AuthUnavailable
-from .graph import PAGE_SIZE, Graph, prefer
-from .mime import Extracted, extract
+from .graph import PAGE_SIZE, SESSION_STATUSES, Graph, prefer
+from .mime import extract
+from .search import short_id
 
 log = structlog.get_logger()
 
@@ -33,6 +34,13 @@ SELECT = (
 PERMANENT = frozenset({400, 403, 404, 406, 410, 413, 415, 422})
 # Graph allows 4 concurrent requests per mailbox per app; more only buys 429s.
 DOWNLOAD_WORKERS = 4
+# An item ($value, event GET) failing on its own is retried with back-off (1 min, doubling, capped)
+# and given up only once its attempts span a day: an outage never costs it, it never wedges a round.
+RETRY_FIRST = 60.0
+RETRY_MAX = 4 * 3600.0
+GIVE_UP_AFTER = 86400.0
+# One item, not the mailbox: the connection dropped or stalled mid-body.
+ITEM_TRANSPORT_ERRORS = (httpx.ReadTimeout, httpx.WriteTimeout, httpx.ReadError, httpx.RemoteProtocolError)
 # Listing ids is latency-bound: 10× fewer sequential pages than the client's default page size.
 LIST_PAGE_SIZE = 1000
 # Delta cursors Graph no longer honours: start the round over (stored MIME is not refetched).
@@ -68,12 +76,37 @@ class Stored:
     size: int | None = None
     text: str | None = None
     error: str | None = None
+    transient: bool = False
     gone: bool = False
     ical_uid: str | None = None
 
 
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
 def _now() -> str:
-    return datetime.now(UTC).isoformat()
+    return _utcnow().isoformat()
+
+
+def _stamp(moment: datetime) -> str:
+    # Fixed width: compared as text in SQL.
+    return moment.isoformat(timespec="seconds")
+
+
+def now_stamp() -> str:
+    return _stamp(_utcnow())
+
+
+def _retry_delay(failures: int) -> float:
+    return min(RETRY_FIRST * 2.0 ** (failures - 1), RETRY_MAX)
+
+
+def back_off(failures: int) -> tuple[str, bool]:
+    """After an item's `failures`-th transient failure in a row: when its next attempt is due, and
+    whether to give up (its attempts already span GIVE_UP_AFTER)."""
+    waited = sum(_retry_delay(n) for n in range(1, failures))
+    return _stamp(_utcnow() + timedelta(seconds=_retry_delay(failures))), waited >= GIVE_UP_AFTER
 
 
 def path_id(msg_id: str) -> str:
@@ -88,24 +121,32 @@ def _address(entry: dict[str, Any] | None) -> str:
 
 def fetch_mime(graph: Graph, msg_id: str) -> Stored:
     """Download the verbatim MIME and derive what the archive keeps. Runs in a worker thread.
-    An HTTP error status is recorded on the message; transport errors propagate (the round stops
-    and resumes later)."""
+    A permanent HTTP error is recorded on the message, a transient one about this item (5xx, read
+    timeout) is counted on it; mailbox-wide errors propagate (the round stops and resumes later)."""
     try:
-        raw = graph.request("GET", f"me/messages/{path_id(msg_id)}/$value").content
+        try:
+            raw = graph.request("GET", f"me/messages/{path_id(msg_id)}/$value").content
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status not in PERMANENT:
+                raise
+            if status == 404 and _missing(graph, msg_id):
+                # Not a message (Deleted Items' delta lists items /messages does not) or deleted since
+                # listed: a tombstone, never a live row inflating the AC1 count.
+                return Stored(msg_id, gone=True)
+            return Stored(msg_id, error=f"http {status}")
+    # The $value or the 404 lookup after it: same rule for both.
+    except ITEM_TRANSPORT_ERRORS as exc:
+        return Stored(msg_id, error=type(exc).__name__, transient=True)
     except httpx.HTTPStatusError as exc:
-        # Only a verdict on the item itself is final; throttling, auth and 5xx left after the
-        # client's own retries stop the round so a later one fetches it.
-        if exc.response.status_code not in PERMANENT:
+        status = exc.response.status_code
+        if status in SESSION_STATUSES:
             raise
-        if exc.response.status_code == 404 and _missing(graph, msg_id):
-            # Not a message (Deleted Items' delta lists items /messages does not) or deleted since
-            # listed: a tombstone, never a live row inflating the AC1 count.
-            return Stored(msg_id, gone=True)
-        return Stored(msg_id, error=f"http {exc.response.status_code}")
-    try:
-        found = extract(raw)
-    except Exception:  # noqa: BLE001 — unparseable MIME is still archived verbatim
-        found = Extracted()
+        # Left after the client's retries: the cursor still advances, the catch-up retries it.
+        return Stored(msg_id, error=f"http {status}", transient=True)
+    found = extract(raw)
+    if found.error:
+        log.warning("extract_failed", error=found.error, short_id=short_id(msg_id))
     return Stored(
         msg_id,
         zstd.compress(raw),
@@ -194,14 +235,30 @@ def _store_downloads(
     # the page stays in memory until the page ends.
     completed = as_completed(futures)
     del futures
-    # A failed download fails itself, not the page: keep storing the others, then raise so the
-    # round stops and its cursor stays put. Queued downloads die with the caller's executor.
+    # A mailbox-wide failure fails its download, not the page: keep storing the others, then raise
+    # so the round stops and its cursor stays put. Queued downloads die with the caller's executor.
     broken: list[Exception] = []
+    path: str | None = None
     for future in completed:
         try:
             s = future.result()
         except (httpx.HTTPError, AuthExpired, AuthUnavailable) as exc:
             broken.append(exc)
+            continue
+        if s.gone or s.error:
+            path = path or _folder_path(db, folder_id)
+        if s.transient:
+            with db:
+                row = db.execute("SELECT mime_attempts FROM messages WHERE id=?", (s.id,)).fetchone()
+                failures = (row[0] if row else 0) + 1
+                retry_at, give_up = back_off(failures)
+                db.execute(
+                    "UPDATE messages SET mime_attempts=?, mime_retry_at=?, mime_error=? "
+                    "WHERE id=? AND mime IS NULL",
+                    (failures, retry_at, s.error if give_up else None, s.id),
+                )
+            c.failed += 1
+            log.warning("mime_unavailable", error=s.error, short_id=short_id(s.id), path=path)
             continue
         with db:
             db.execute(
@@ -213,15 +270,20 @@ def _store_downloads(
         if s.gone:
             # No mime_error: a relisted item is fetched (and tombstoned) again, never left live.
             c.deleted += 1
-            log.warning("item_gone", folder_id=folder_id)
+            log.warning("item_gone", short_id=short_id(s.id), path=path)
         elif s.error:
             c.failed += 1
-            log.warning("mime_unavailable", error=s.error)
+            log.warning("mime_unavailable", error=s.error, short_id=short_id(s.id), path=path)
         else:
             c.downloaded += 1
         del s, future
     if broken:
         raise broken[0]
+
+
+def _folder_path(db: sqlite3.Connection, folder_id: str) -> str:
+    row = db.execute("SELECT path FROM folders WHERE id=?", (folder_id,)).fetchone()
+    return row[0] if row else folder_id
 
 
 def _apply_page(
@@ -231,6 +293,7 @@ def _apply_page(
     folder_id: str,
     items: list[dict[str, Any]],
     c: Counters,
+    started: str,
 ) -> None:
     now = _now()
     live = [i for i in items if "@removed" not in i]
@@ -246,8 +309,9 @@ def _apply_page(
         need = [
             row[0]
             for row in db.execute(
-                f"SELECT id FROM messages WHERE id IN ({marks}) AND mime IS NULL AND mime_error IS NULL",
-                [i["id"] for i in live],
+                f"SELECT id FROM messages WHERE id IN ({marks}) AND mime IS NULL AND mime_error IS NULL "
+                "AND (mime_retry_at IS NULL OR mime_retry_at <= ?)",
+                [*(i["id"] for i in live), started],
             )
         ]
         _store_downloads(graph, db, executor, folder_id, need, c)
@@ -268,10 +332,13 @@ def _needs_resync(exc: httpx.HTTPStatusError) -> bool:
     if exc.response.status_code == 410:
         return True
     try:
-        code = exc.response.json().get("error", {}).get("code", "")
+        body = exc.response.json()
     except ValueError:
         return False
-    return exc.response.status_code == 400 and code in _RESYNC_CODES
+    # Security: an error body is server input; any JSON shape must answer False, not raise.
+    error = body.get("error") if isinstance(body, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return exc.response.status_code == 400 and isinstance(code, str) and code in _RESYNC_CODES
 
 
 def _catch_up(
@@ -281,6 +348,7 @@ def _catch_up(
     folder_id: str,
     c: Counters,
     pause: Callable[[], bool] | None,
+    started: str,
 ) -> bool:
     """Fetch MIME still missing in this folder, a page-sized chunk at a time; False if `pause()`
     stopped it (the next round re-queries what is still missing). An incremental round only lists
@@ -290,8 +358,8 @@ def _catch_up(
         row[0]
         for row in db.execute(
             "SELECT id FROM messages WHERE folder_id=? AND mime IS NULL AND mime_error IS NULL "
-            "AND deleted_at IS NULL",
-            (folder_id,),
+            "AND deleted_at IS NULL AND (mime_retry_at IS NULL OR mime_retry_at <= ?)",
+            (folder_id, started),
         )
     ]
     if missing:
@@ -307,7 +375,8 @@ def retry_failed(db: sqlite3.Connection) -> int:
     """Forget recorded download failures so the next round tries those messages again."""
     with db:
         return db.execute(
-            "UPDATE messages SET mime_error=NULL WHERE mime IS NULL AND mime_error IS NOT NULL"
+            "UPDATE messages SET mime_error=NULL, mime_attempts=0, mime_retry_at=NULL "
+            "WHERE mime IS NULL AND (mime_error IS NOT NULL OR mime_attempts > 0)"
         ).rowcount
 
 
@@ -325,6 +394,8 @@ def sync_folder(
     row = db.execute("SELECT next_link, delta_link FROM sync_state WHERE key=?", (key,)).fetchone()
     url = (row and (row["next_link"] or row["delta_link"])) or fresh
     c = Counters()
+    # Attempts failing during this round are due after its start: at most one per message per round.
+    started = now_stamp()
     first = True
     while True:
         # The first page always runs: a round that may pause at once could never progress.
@@ -345,13 +416,13 @@ def sync_folder(
         for link in (page.get("@odata.nextLink"), page.get("@odata.deltaLink")):
             if link:
                 graph.url(link)  # Security: a link the client would refuse never becomes the cursor
-        _apply_page(graph, db, executor, folder_id, page.get("value", []), c)
+        _apply_page(graph, db, executor, folder_id, page.get("value", []), c, started)
         if next_link := page.get("@odata.nextLink"):
             _save_cursor(db, key, next_link, None)
             url = next_link
         elif delta_link := page.get("@odata.deltaLink"):
             _save_cursor(db, key, None, delta_link)
-            c.paused = not _catch_up(graph, db, executor, folder_id, c, pause)
+            c.paused = not _catch_up(graph, db, executor, folder_id, c, pause, started)
             return c
         else:
             raise RuntimeError("delta page carries neither nextLink nor deltaLink")
@@ -384,7 +455,7 @@ def reconcile_steps(graph: Graph, db: sqlite3.Connection, folder_id: str, c: Rec
         )
         c.unsynced += len(chunk) - stored.fetchone()[0]
     if c.unsynced:
-        log.info("reconcile_unsynced", folder_id=folder_id, count=c.unsynced)
+        log.info("reconcile_unsynced", path=_folder_path(db, folder_id), count=c.unsynced)
     # A message stored after the listing is looked up too: the lookup finds it in place, a no-op.
     lookups = [(m, False) for m in sorted(local - server)] + [(m, True) for m in sorted(server & tombstoned)]
     for n, (msg_id, revive) in enumerate(lookups, 1):

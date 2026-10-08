@@ -73,15 +73,17 @@ def _attempt(
 
 def calendar_round(
     graph: Graph, db: sqlite3.Connection, executor: Executor, pause: Callable[[], bool] | None = None
-) -> None:
-    """The calendar is one more isolated folder: its own failures are logged, mailbox-wide ones propagate."""
+) -> bool:
+    """The calendar is one more isolated folder: its own failures are logged (False), mailbox-wide
+    ones propagate."""
     try:
         c = sync_calendar(graph, db, executor, pause)
     except FOLDER_ERRORS as exc:
         folder_failed(exc, "(calendar)", "calendar_round_failed")
-        return
+        return False
     if any(getattr(c, name) for name in _SUMMED):
         log.info("calendar_synced", **vars(c))
+    return True
 
 
 def folder_failed(exc: Exception, path: str, event: str) -> None:
@@ -94,14 +96,19 @@ def folder_failed(exc: Exception, path: str, event: str) -> None:
 
 def sync_pass(
     graph: Graph, db: sqlite3.Connection, executor: Executor, folders: Sequence[sqlite3.Row]
-) -> Counters:
-    """One full delta round per folder; returns the summed counters."""
+) -> tuple[Counters, int]:
+    """One full delta round per folder; returns the summed counters and how many folders failed on
+    their own (logged, the others still run); mailbox-wide failures propagate."""
     total = Counters()
+    failed = 0
     for folder in folders:
-        c = _round(graph, db, executor, folder)
+        c = _attempt(graph, db, executor, folder)
+        if c is None:
+            failed += 1
+            continue
         for name in _SUMMED:
             setattr(total, name, getattr(total, name) + getattr(c, name))
-    return total
+    return total, failed
 
 
 def _sleep(seconds: float) -> bool:

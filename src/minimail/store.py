@@ -62,6 +62,16 @@ def open_db(data_dir: Path) -> sqlite3.Connection:
     return db
 
 
+# Every metadata upsert rewrites these columns unchanged: re-indexing only when one differs.
+_FTS_UPDATE = """CREATE TRIGGER messages_fts_update AFTER UPDATE OF subject, sender, recipients, search_text
+       ON messages WHEN old.subject IS NOT new.subject OR old.sender IS NOT new.sender
+         OR old.recipients IS NOT new.recipients OR old.search_text IS NOT new.search_text BEGIN
+         INSERT INTO messages_fts (messages_fts, rowid, subject, sender, recipients, search_text)
+         VALUES ('delete', old.rowid, old.subject, old.sender, old.recipients, old.search_text);
+         INSERT INTO messages_fts (rowid, subject, sender, recipients, search_text)
+         VALUES (new.rowid, new.subject, new.sender, new.recipients, new.search_text);
+       END"""
+
 # External content: the index stores no second copy of the text. VACUUM may renumber `messages`
 # rowids (no INTEGER PRIMARY KEY), which `minimail reindex` repairs with a rebuild.
 _FTS = (
@@ -75,13 +85,7 @@ _FTS = (
          INSERT INTO messages_fts (messages_fts, rowid, subject, sender, recipients, search_text)
          VALUES ('delete', old.rowid, old.subject, old.sender, old.recipients, old.search_text);
        END""",
-    """CREATE TRIGGER messages_fts_update AFTER UPDATE OF subject, sender, recipients, search_text
-       ON messages BEGIN
-         INSERT INTO messages_fts (messages_fts, rowid, subject, sender, recipients, search_text)
-         VALUES ('delete', old.rowid, old.subject, old.sender, old.recipients, old.search_text);
-         INSERT INTO messages_fts (rowid, subject, sender, recipients, search_text)
-         VALUES (new.rowid, new.subject, new.sender, new.recipients, new.search_text);
-       END""",
+    _FTS_UPDATE,
     "INSERT INTO messages_fts (messages_fts) VALUES ('rebuild')",
 )
 
@@ -140,8 +144,38 @@ def _has_calendar(db: sqlite3.Connection) -> bool:
     return db.execute("SELECT 1 FROM sqlite_master WHERE name='events_fts'").fetchone() is not None
 
 
+# Per-item back-off of transient fetch failures (mail.back_off), and why an event GET was given up.
+_RETRY_COLUMNS = {
+    "messages": {"mime_attempts": "INTEGER NOT NULL DEFAULT 0", "mime_retry_at": "TEXT"},
+    "events": {
+        "event_attempts": "INTEGER NOT NULL DEFAULT 0",
+        "event_retry_at": "TEXT",
+        "fetch_error": "TEXT",
+    },
+}
+
+
+def _missing_retry_columns(db: sqlite3.Connection) -> list[tuple[str, str, str]]:
+    missing = []
+    for table, columns in _RETRY_COLUMNS.items():
+        have = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+        missing += [(table, name, kind) for name, kind in columns.items() if name not in have]
+    return missing
+
+
+def _has_fts_when(db: sqlite3.Connection) -> bool:
+    row = db.execute("SELECT sql FROM sqlite_master WHERE name='messages_fts_update'").fetchone()
+    return row is not None and row[0] == _FTS_UPDATE
+
+
 def needs_migration(db: sqlite3.Connection) -> bool:
-    return not (_has_message_count(db) and _has_fts(db) and _has_calendar(db))
+    return not (
+        _has_message_count(db)
+        and _has_fts(db)
+        and _has_calendar(db)
+        and not _missing_retry_columns(db)
+        and _has_fts_when(db)
+    )
 
 
 def _migrate(db: sqlite3.Connection) -> None:
@@ -159,6 +193,11 @@ def _migrate(db: sqlite3.Connection) -> None:
         if not _has_calendar(db):
             for statement in _CALENDAR:
                 db.execute(statement)
+        for table, name, kind in _missing_retry_columns(db):
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+        if not _has_fts_when(db):
+            db.execute("DROP TRIGGER messages_fts_update")
+            db.execute(_FTS_UPDATE)
         db.commit()
     except BaseException:
         db.rollback()

@@ -110,7 +110,8 @@ is lost locally.
   `sync --retry-failed`.
 - **Covers**: AC1, AC2, AC3
 - **Data model impact**: `messages` (id, internet_message_id, folder_id, received_at, meta JSON,
-  mime BLOB, mime_sha256, mime_size, mime_error, search_text, deleted_at), `sync_state` (key,
+  mime BLOB, mime_sha256, mime_size, mime_error, mime_attempts, mime_retry_at, search_text,
+  deleted_at), `sync_state` (key,
   next_link, delta_link, updated_at)
 - **DoD**: full backfill of the real mailbox; AC1 counts match; `verify` reports 0 mismatches;
   extraction tests on a fixture corpus (QP, base64, latin-1, cp1252, HTML-only) green.
@@ -140,7 +141,8 @@ is lost locally.
   inherits it ignored).
 - **Covers**: AC7, AC8, AC9
 - **Data model impact**: `messages_fts` (external-content FTS5 on `messages`: subject, sender,
-  recipients, search_text) + insert/update/delete triggers
+  recipients, search_text) + insert/update/delete triggers (the update trigger fires only `WHEN` an
+  indexed column actually changed)
 - **DoD**: AC7/AC8 fixture tests green; attachment extraction test incl. a `../` filename.
 
 ### Phase 5 — Calendar
@@ -155,7 +157,7 @@ is lost locally.
 - **Covers**: AC14, AC15, AC16, AC17, AC18, AC19
 - **Data model impact**: `events` (id, type, series_master_id, ical_uid, start_utc, end_utc,
   is_cancelled, meeting_thread_id, subject, raw JSON, version, search_text, first_seen_at,
-  updated_at, deleted_at), `events_fts` (external content: subject, search_text) + triggers,
+  updated_at, deleted_at, event_attempts, event_retry_at, fetch_error), `events_fts` (external content: subject, search_text) + triggers,
   `messages.ical_uid`, `sync_state.window_end` (the calendar row: window end + cursors; the start is
   fixed) — all added to existing archives in place, in one transaction
 - **DoD**: real backfill count matches AC14; live test: create/move/delete a test event → reflected
@@ -175,8 +177,9 @@ is lost locally.
 
 ## Data model impact (summary)
 
-New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ical_uid`),
-`messages_fts` (+ its triggers), `events`, `events_fts` (+ its triggers), `sync_state` (+ `window_end`).
+New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ical_uid`, `mime_attempts`,
+`mime_retry_at`), `messages_fts` (+ its triggers; update only `WHEN` an indexed column changed),
+`events` (+ `event_attempts`, `event_retry_at`, `fetch_error`), `events_fts` (+ its triggers), `sync_state` (+ `window_end`).
 
 ## Open questions
 
@@ -198,8 +201,14 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
   folder's first round.
 - **Backfill = first delta round** per folder: one code path for backfill and incremental sync, one
   resume cursor (`sync_state.next_link`); hence `sync_state` lands in phase 2.
-- **Only permanent 4xx are recorded as download failures**; throttling, auth and 5xx stop the round,
-  and every round ends by fetching any MIME still missing in the folder.
+- **Permanent 4xx are recorded as download failures at once**; a `$value` failing on its own
+  (5xx left after retries, read/write timeout, connection dropped mid-body — on the `$value` or
+  on the lookup after its 404) leaves the MIME missing and the cursor advances; it is retried with back-off (`mime_retry_at`:
+  1 min, doubling, capped at 4 h; at most one attempt per round) and recorded only once its attempts
+  (`mime_attempts`) span a day, so an outage never costs a MIME and neither a page nor the catch-up
+  can wedge; `--retry-failed` resets both. Mailbox-wide failures (401/429 after retries, sign-in,
+  connection errors) stop the round. Every round ends by fetching any MIME still missing (and due)
+  in the folder.
 - **Data dir** `./data` (gitignored, `MINIMAIL_DATA_DIR` overrides), like miniteams: typically a
   symlink to NAS storage. SQLite over NFS → one writer at a time, all processes on the same host.
 - **Personal data**: archive stays local (`0700`/`0600`), CLI + MCP over stdio only, no network
@@ -223,11 +232,15 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
   round's token reporting what changes while it is listed (live check).
 - **Refetch rule**: the delta item's `changeKey` (else `lastModifiedDateTime`; measured on every
   master, single and exception, never on occurrences) is stored beside the full JSON it was fetched
-  for. A full `GET` answering a permanent status (mail's set: 400, 403, 404, 406, 410, 413, 415, 422)
-  is logged (`event_fetch_failed`) and does not stop the round: a new event keeps its delta item,
-  an archived one keeps its full JSON; either way with no version, so the next listing fetches it
-  again (a deletion arrives as `@removed`). Throttling, auth and 5xx left after retries stop the round
-  before its cursor moves.
+  for. A full `GET` failing on its own (any status but 401/429 left after retries, a read/write
+  timeout) is logged (`event_fetch_failed`) and does not stop the round: a new event keeps its delta
+  item, an archived one keeps its full JSON; either way with no version, so the next listing fetches
+  it again (a deletion arrives as `@removed`); delta re-lists only changed events, so each round
+  ends by re-fetching up to a page of events whose GET failed transiently once their back-off is due
+  (`event_retry_at`, the mail schedule: 1 min doubling to 4 h, given up after a day, yielding to a
+  pause). A permanent status records `fetch_error` and leaves the event to a delta re-listing (or
+  the daily window slide); a successful GET clears both. Mailbox-wide failures (401/429 after retries, sign-in, connection errors) stop
+  the round before its cursor moves.
 - **Unchanged re-listing writes nothing**: a row is rewritten only if its JSON or version changed or it
   was a tombstone, so occurrences re-listed every round cause no index churn.
 - **Occurrences are shown through their master**: their delta item is slim, so `agenda`/`event` read
@@ -267,7 +280,8 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
   AC4 worst case ≈ Inbox interval (30 s) + the one unit already running when the Inbox fell due
   (≤ ~100 requests, ~12 s at 8/s) + the Inbox round itself; a tree refresh never sits in between,
   it runs after the Inbox round.
-- **A failing folder does not stop the others**: a folder round (Inbox included) failing on its own
+- **A failing folder does not stop the others** (one-shot `sync` too, which then exits 1): a folder
+  round (Inbox included) failing on its own
   — HTTP error status (folder gone, forbidden, 5xx including 503/504 left after retries), a read
   or write timeout (one huge or stuck item), non-JSON
   or malformed delta page, a link the client refuses — is logged; an other folder is retried once

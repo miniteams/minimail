@@ -12,14 +12,24 @@ import sqlite3
 from collections.abc import Callable
 from concurrent.futures import Executor
 from datetime import UTC, date, datetime, time, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import unquote
 
 import httpx
 import structlog
 
-from .graph import Graph
-from .mail import PERMANENT, Counters, _address, _needs_resync, _now, path_id
+from .graph import PAGE_SIZE, SESSION_STATUSES, Graph
+from .mail import (
+    ITEM_TRANSPORT_ERRORS,
+    PERMANENT,
+    Counters,
+    _address,
+    _needs_resync,
+    _now,
+    back_off,
+    now_stamp,
+    path_id,
+)
 from .mime import MAX_TEXT, html_to_text
 from .search import fts_query, short_id
 
@@ -80,7 +90,8 @@ def _store(db: sqlite3.Connection, event_id: str, raw: str, version: str | None,
              ical_uid=excluded.ical_uid, start_utc=excluded.start_utc, end_utc=excluded.end_utc,
              is_cancelled=excluded.is_cancelled, meeting_thread_id=excluded.meeting_thread_id,
              subject=excluded.subject, raw=excluded.raw, version=excluded.version,
-             search_text=excluded.search_text, updated_at=excluded.updated_at, deleted_at=NULL
+             search_text=excluded.search_text, updated_at=excluded.updated_at, deleted_at=NULL,
+             event_attempts=0, event_retry_at=NULL, fetch_error=NULL
            -- An unchanged re-listing (occurrences, every round) leaves the row and its index alone.
            WHERE events.raw IS NOT excluded.raw OR events.version IS NOT excluded.version
              OR events.deleted_at IS NOT NULL""",
@@ -103,15 +114,41 @@ def _store(db: sqlite3.Connection, event_id: str, raw: str, version: str | None,
     )
 
 
-def _fetch(graph: Graph, event_id: str) -> str | None:
+class FetchFailed(NamedTuple):
+    error: str
+    transient: bool  # False: a verdict on the item (PERMANENT), never retried until re-listed
+
+
+def _fetch(graph: Graph, event_id: str) -> str | FetchFailed:
     try:
         return graph.request("GET", f"me/events/{path_id(event_id)}").text
-    except httpx.HTTPStatusError as exc:
-        # Throttling, auth and 5xx left after retries stop the round; a verdict on the item does not.
-        if exc.response.status_code not in PERMANENT:
+    except (httpx.HTTPStatusError, *ITEM_TRANSPORT_ERRORS) as exc:
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        # Only mailbox-wide failures stop the round; the item keeps no version, so its next listing
+        # (or, if transient, the end-of-round refetch once due) fetches it again.
+        if status in SESSION_STATUSES:
             raise
-        log.warning("event_fetch_failed", status=exc.response.status_code)
-        return None
+        log.warning(
+            "event_fetch_failed", status=status, error=type(exc).__name__, short_id=short_id(event_id)
+        )
+        error = f"http {status}" if status else type(exc).__name__
+        return FetchFailed(error, status not in PERMANENT)
+
+
+def _mark_failed(db: sqlite3.Connection, event_id: str, failed: FetchFailed) -> None:
+    """Out of the end-of-round refetch: for good if refused, else until its back-off is due."""
+    if not failed.transient:
+        db.execute(
+            "UPDATE events SET fetch_error=?, event_retry_at=NULL WHERE id=?", (failed.error, event_id)
+        )
+        return
+    row = db.execute("SELECT event_attempts FROM events WHERE id=?", (event_id,)).fetchone()
+    failures = (row[0] if row else 0) + 1
+    retry_at, give_up = back_off(failures)
+    db.execute(
+        "UPDATE events SET event_attempts=?, event_retry_at=?, fetch_error=? WHERE id=?",
+        (failures, retry_at, failed.error if give_up else None, event_id),
+    )
 
 
 def _known(db: sqlite3.Connection, event_id: str) -> bool:
@@ -132,7 +169,8 @@ def _apply_page(
     now = _now()
     with db:
         for item in live:
-            if (raw := fetched.get(item["id"])) is not None:
+            raw = fetched.get(item["id"])
+            if isinstance(raw, str):
                 _store(db, item["id"], raw, _version(item), now)
                 c.downloaded += 1
             elif item["id"] in fetched and _known(db, item["id"]):
@@ -158,6 +196,8 @@ def _apply_page(
                     "UPDATE events SET deleted_at=NULL, updated_at=? WHERE id=? AND deleted_at IS NOT NULL",
                     (now, item["id"]),
                 )
+            if isinstance(raw, FetchFailed):
+                _mark_failed(db, item["id"], raw)
         for item in items:
             if "@removed" in item:
                 c.deleted += db.execute(
@@ -165,6 +205,31 @@ def _apply_page(
                     (now, now, item["id"]),
                 ).rowcount
     c.listed += len(live)
+
+
+def _refetch_unversioned(
+    graph: Graph, db: sqlite3.Connection, executor: Executor, c: Counters, started: str
+) -> None:
+    """Up to a page of events whose full GET failed transiently and whose back-off is due by this
+    round's start (delta re-lists them only when they change); refused ones wait for a re-listing."""
+    ids = [
+        row[0]
+        for row in db.execute(
+            "SELECT id FROM events WHERE version IS NULL AND fetch_error IS NULL "
+            "AND type IS NOT 'occurrence' AND deleted_at IS NULL "
+            "AND (event_retry_at IS NULL OR event_retry_at <= ?) ORDER BY event_retry_at LIMIT ?",
+            (started, PAGE_SIZE),
+        )
+    ]
+    fetched = list(zip(ids, executor.map(lambda event_id: _fetch(graph, event_id), ids), strict=True))
+    now = _now()
+    with db:
+        for event_id, raw in fetched:
+            if isinstance(raw, FetchFailed):
+                _mark_failed(db, event_id, raw)
+                continue
+            _store(db, event_id, raw, _version(json.loads(raw)), now)
+            c.downloaded += 1
 
 
 def _save_cursor(db: sqlite3.Connection, next_link: str | None, delta_link: str | None, end: str) -> None:
@@ -197,6 +262,7 @@ def sync_calendar(
     url = (row and (row["next_link"] or row["delta_link"])) or fresh
     current = row["window_end"] if row and url != fresh else end
     c = Counters()
+    started = now_stamp()
     first = True
     while True:
         # The first page always runs: a round that may pause at once could never progress.
@@ -224,6 +290,10 @@ def sync_calendar(
         elif delta_link := page.get("@odata.deltaLink"):
             _save_cursor(db, None, delta_link, current)
             if current == end:
+                if pause is not None and pause():
+                    c.paused = True
+                else:
+                    _refetch_unversioned(graph, db, executor, c, started)
                 return c
             log.info("calendar_window_slide", end=end)
             url, current = fresh, end

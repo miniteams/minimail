@@ -26,7 +26,6 @@ class Settings(BaseSettings):
     # carries Mail.ReadWrite / Calendars.ReadWrite, so no consent is ever needed.
     client_id: str = "1fec8e78-bce4-4aaf-ab1b-5451cc387264"
     msal_cache: Path = Field(default_factory=_default_msal_cache)
-    graph_url: str = "https://graph.microsoft.com/v1.0"
     data_dir: Path = Path("data")
     # Security: the only place MCP `get_attachments` writes to; unset = `<data_dir>/exports`.
     export_dir: Path | None = None

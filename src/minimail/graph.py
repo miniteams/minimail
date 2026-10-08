@@ -21,6 +21,8 @@ SESSION_STATUSES = frozenset({401, 429})
 _MAX_RETRIES = 6
 _MAX_BACKOFF = 60.0
 PAGE_SIZE = 100
+# Security: the bearer token's only destination; not configurable.
+GRAPH_URL = "https://graph.microsoft.com/v1.0"
 
 
 def prefer(page_size: int) -> str:

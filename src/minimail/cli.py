@@ -24,8 +24,8 @@ from . import __version__, calendar
 from .auth import AuthExpired, AuthUnavailable, TokenSource
 from .config import Settings
 from .folders import sync_folders
-from .graph import Graph
-from .live import FOLDER_ERRORS, Cadence, folder_failed, run_live, sync_pass
+from .graph import GRAPH_URL, Graph
+from .live import FOLDER_ERRORS, Cadence, calendar_round, folder_failed, run_live, sync_pass
 from .logging import setup_logging
 from .mail import (
     DOWNLOAD_WORKERS,
@@ -44,7 +44,7 @@ log = structlog.get_logger()
 
 
 def _graph(settings: Settings) -> Graph:
-    return Graph(TokenSource(settings), settings.graph_url, max_rps=settings.max_rps)
+    return Graph(TokenSource(settings), GRAPH_URL, max_rps=settings.max_rps)
 
 
 def _printable(text: str) -> str:
@@ -100,6 +100,7 @@ def cmd_sync(settings: Settings, db: sqlite3.Connection, args: argparse.Namespac
     graph = _graph(settings)
     executor = ThreadPoolExecutor(DOWNLOAD_WORKERS, thread_name_prefix="mime")
     clean = False
+    failed = 0
     selected: list[sqlite3.Row] = []
     try:
         # --live walks the tree inside its loop, where a sign-in or network outage is retried.
@@ -124,10 +125,10 @@ def cmd_sync(settings: Settings, db: sqlite3.Connection, args: argparse.Namespac
                 ),
             )
         else:
-            total = sync_pass(graph, db, executor, selected)
-            log.info("sync_done", folders=len(selected), **vars(total))
-            if not args.folder:
-                log.info("calendar_synced", **vars(calendar.sync_calendar(graph, db, executor)))
+            total, failed = sync_pass(graph, db, executor, selected)
+            if not args.folder and not calendar_round(graph, db, executor):
+                failed += 1
+            log.info("sync_done", folders=len(selected), failed_folders=failed, **vars(total))
         clean = True
     finally:
         # Close first: it wakes workers asleep in a back-off or a pacing slot, so exit is prompt.
@@ -136,7 +137,7 @@ def cmd_sync(settings: Settings, db: sqlite3.Connection, args: argparse.Namespac
         executor.shutdown(wait=clean, cancel_futures=not clean)
     if not args.live:
         _print_folders(db, selected)
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_reconcile(settings: Settings, db: sqlite3.Connection, args: argparse.Namespace) -> int:
@@ -210,6 +211,8 @@ def cmd_reindex(settings: Settings, db: sqlite3.Connection, args: argparse.Names
     with closing(reader):
         for row in reader.execute("SELECT id, mime FROM messages WHERE mime IS NOT NULL"):
             found = extract(zstd.decompress(row["mime"]))
+            if found.error:
+                log.warning("extract_failed", error=found.error, short_id=short_id(row["id"]))
             db.execute(
                 "UPDATE messages SET search_text=?, ical_uid=? WHERE id=?",
                 (found.text, found.ical_uid, row["id"]),

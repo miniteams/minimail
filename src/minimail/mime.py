@@ -10,6 +10,7 @@ import mimetypes
 import os
 import re
 import stat
+import threading
 from collections.abc import Iterator, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -19,11 +20,20 @@ from pathlib import Path
 
 # ponytail: hard cap per message; a multi-MB text body adds nothing a search can use.
 MAX_TEXT = 1_000_000
+# Parsing holds ~5x the raw size: above this, one parse at a time across download workers.
+BIG_MIME = 20_000_000
+_BIG_GATE = threading.Lock()
 
-_SKIP_TAGS = frozenset({"script", "style", "head", "title", "noscript", "template"})
+# No `head`: without a `</head>` it would hide the whole body; its text lives in title/style/script.
+_SKIP_TAGS = frozenset({"script", "style", "title", "noscript", "template"})
 _BLOCK_TAGS = frozenset(
-    {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "blockquote"}
-)
+    {
+        "p", "div", "br", "hr", "tr", "td", "th", "li", "ul", "ol", "dl", "dt", "dd",
+        "h1", "h2", "h3", "h4", "h5", "h6", "table", "thead", "tbody", "tfoot", "caption",
+        "blockquote", "pre", "section", "article", "header", "footer", "nav", "aside", "main",
+        "address", "figure", "figcaption", "form", "fieldset", "center",
+    }
+)  # fmt: skip
 
 
 class _HTMLText(HTMLParser):
@@ -41,6 +51,8 @@ class _HTMLText(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag in _SKIP_TAGS and self._skip:
             self._skip -= 1
+        elif tag in _BLOCK_TAGS:
+            self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
         if not self._skip:
@@ -55,7 +67,8 @@ def html_to_text(html: str) -> str:
         parser.close()
     except AssertionError:  # pragma: no cover — html.parser's last-resort on pathological markup
         pass
-    return " ".join(" ".join(parser.parts).split())
+    # Inline tags split no word ("Bon<b>jour</b>"): only block tags add a separator.
+    return " ".join("".join(parser.parts).split())
 
 
 def parse(raw: bytes) -> EmailMessage:
@@ -99,15 +112,18 @@ class Extracted:
     text: str = ""
     attachments: list[str] = field(default_factory=list)
     ical_uid: str | None = None
+    error: str | None = None  # set when parsing failed: the caller logs it with the message's id
 
 
 def body_text(msg: EmailMessage) -> str:
     """The message's own text body (plain preferred, else HTML reduced to its visible text)."""
     body = msg.get_body(preferencelist=("plain", "html"))
-    if body is None:
-        return ""
-    text = part_text(body)
-    return html_to_text(text) if body.get_content_type() == "text/html" else text
+    return "" if body is None else _as_text(body)
+
+
+def _as_text(part: Message) -> str:
+    text = part_text(part)
+    return html_to_text(text) if part.get_content_type() == "text/html" else text
 
 
 @dataclass
@@ -157,7 +173,17 @@ def attachments(raw: bytes, depth: int = 0) -> list[Attachment]:
 
 
 def _body_text(msg: EmailMessage, out: list[str], attachments: list[str], depth: int) -> None:
-    out.append(body_text(msg))
+    body = msg.get_body(preferencelist=("plain", "html"))
+    out.append("" if body is None else _as_text(body))
+    if msg.get_content_type() == "multipart/mixed":
+        # Text, inline image, text: the parts after the first are body text too.
+        for extra in msg.iter_parts():
+            if (
+                extra is not body
+                and extra.get_content_type() in {"text/plain", "text/html"}
+                and extra.get_content_disposition() != "attachment"
+            ):
+                out.append(_as_text(extra))
     for part in _leaves(msg):
         if part.get_content_type() == "message/rfc822":
             # Forwarded mail as attachment: its own headers and body are searchable too.
@@ -203,18 +229,25 @@ def calendar_uid(msg: Message) -> str | None:
 
 
 def extract(raw: bytes) -> Extracted:
+    if len(raw) <= BIG_MIME:
+        return _extract(raw)
+    with _BIG_GATE:
+        return _extract(raw)
+
+
+def _extract(raw: bytes) -> Extracted:
     try:
         msg = parse(raw)
-    except Exception:  # noqa: BLE001 — e.g. RecursionError on absurd nesting: index nothing, keep the MIME
-        return Extracted()
+    except Exception as exc:  # noqa: BLE001 — e.g. RecursionError on absurd nesting: index nothing, keep the MIME
+        return Extracted(error=type(exc).__name__)
     out: list[str] = []
     attachments: list[str] = []
-    ical_uid = None
+    ical_uid = error = None
     try:
         _body_text(msg, out, attachments, 0)
         ical_uid = calendar_uid(msg)
-    except Exception:  # noqa: BLE001 — keep whatever headers we have; the raw MIME stays intact
-        pass
+    except Exception as exc:  # noqa: BLE001 — keep whatever headers we have; the raw MIME stays intact
+        error = type(exc).__name__
     recipients = ", ".join(h for h in (header(msg, n) for n in ("to", "cc", "bcc")) if h)
     text = "\n".join(t for t in out if t) + ("\n" + " ".join(attachments) if attachments else "")
     return Extracted(
@@ -224,6 +257,7 @@ def extract(raw: bytes) -> Extracted:
         text=text[:MAX_TEXT],
         attachments=attachments,
         ical_uid=ical_uid,
+        error=error,
     )
 
 

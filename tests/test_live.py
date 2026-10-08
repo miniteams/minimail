@@ -30,7 +30,6 @@ FOLDER_FAULTS = [
     ("malformed", "RuntimeError"),
     ("off_host", "ValueError"),
     (httpx.ReadTimeout("stuck delta"), "ReadTimeout"),
-    ("value_read_timeout", "ReadTimeout"),
 ]
 
 
@@ -252,11 +251,7 @@ def test_a_failing_folder_does_not_starve_the_next(
     clock = Clock()
     fake = LiveGraph(clock)
     fake.folders["F3"] = [[item("m3", "F3")]]
-    if fault == "value_read_timeout":
-        fake.folders["F2"] = [[item("a1", "F2")]]
-        fake.raise_value = {"a1": httpx.ReadTimeout("stuck body")}
-    else:
-        fake.failing = {"F2": fault}
+    fake.failing = {"F2": fault}
     fake.cost["F2"] = 10.0  # a requeue loop would run into the Inbox deadline, not forever
     waits: list[float] = []
     with capture_logs() as logs:
@@ -337,8 +332,9 @@ def test_refused_next_link_never_becomes_the_cursor(db: sqlite3.Connection, pool
 def test_a_failing_inbox_does_not_stop_the_other_folders(
     db: sqlite3.Connection, pool: ThreadPoolExecutor, fault: str
 ) -> None:
-    """The Inbox gets the same per-folder isolation: its delta (or a MIME download in it) failing
-    with a 500, or one body read timing out, every round leaves the other folders syncing."""
+    """The Inbox gets the same per-folder isolation: its delta failing with a 500 every round leaves
+    the other folders syncing; a MIME download in it failing (500, read timeout) does not even fail
+    the Inbox round (001-AC4)."""
     clock = Clock()
     fake = LiveGraph(clock)
     if fault == "delta":
@@ -353,7 +349,10 @@ def test_a_failing_inbox_does_not_stop_the_other_folders(
     with capture_logs() as logs:
         run_live(make_graph(fake), db, pool, CADENCE, wait=waiter(clock, waits, lambda: True), clock=clock)
     assert [e for _, e in _deltas(fake)] == ["tree", "INBOX:0", "F2:0"]
-    assert [e["path"] for e in logs if e["event"] == "folder_round_failed"] == ["Inbox"]
+    failed = [e["path"] for e in logs if e["event"] == "folder_round_failed"]
+    assert failed == (["Inbox"] if fault == "delta" else [])
+    unavailable = [e["path"] for e in logs if e["event"] == "mime_unavailable"]
+    assert unavailable == ([] if fault == "delta" else ["Inbox"])  # the catch-up waits for its back-off
     assert not [e for e in logs if e["event"] == "live_cycle_failed"]
 
 
@@ -641,3 +640,21 @@ def test_a_mailbox_wide_calendar_failure_backs_off_the_cycle(
             make_graph(fake), db, pool, CADENCE, wait=waiter(clock, [], lambda: clock() >= 30), clock=clock
         )
     assert [e["event"] for e in logs if e["event"] == "live_cycle_failed"]
+
+
+def test_one_shot_sync_isolates_a_failing_folder(db: sqlite3.Connection, pool: ThreadPoolExecutor) -> None:
+    """`sync` gets the per-folder isolation too: the failing folder is counted, the others still sync;
+    a mailbox-wide failure still stops the pass."""
+    from minimail.folders import sync_folders
+
+    fake = LiveGraph(Clock())
+    fake.folders = {"F2": [[]], "INBOX": [[item("n1", "INBOX")]], "F3": [[]]}
+    fake.failing = {"F2": 500}
+    graph = make_graph(fake)
+    folders = sync_folders(graph, db)
+    total, failed = live.sync_pass(graph, db, pool, folders)
+    assert (failed, total.downloaded) == (1, 1)
+    assert [e for _, e in _deltas(fake)] == ["tree", "F2:0", "F3:0", "INBOX:0"]
+    fake.failing = {"F2": 429}
+    with pytest.raises(httpx.HTTPStatusError):
+        live.sync_pass(graph, db, pool, folders)

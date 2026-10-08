@@ -724,8 +724,8 @@ DEEP_MULTIPART = (
 
 
 def test_extract_of_an_absurdly_nested_mail_is_empty() -> None:
-    assert mime.extract(DEEP) == mime.Extracted()
-    assert mime.extract(DEEP_MULTIPART) == mime.Extracted()
+    assert mime.extract(DEEP) == mime.Extracted(error="RecursionError")
+    assert mime.extract(DEEP_MULTIPART) == mime.Extracted(error="RecursionError")
 
 
 def test_reindex_and_show_survive_an_absurdly_nested_mail(

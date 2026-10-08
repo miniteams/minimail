@@ -8,6 +8,7 @@ from collections import Counter
 from collections.abc import Iterator
 from compression import zstd
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -17,6 +18,8 @@ from structlog.testing import capture_logs
 from minimail import mail
 from minimail.auth import AuthExpired, AuthUnavailable
 from minimail.mail import local_counts, retry_failed, sync_folder
+from minimail.mime import Extracted
+from minimail.search import short_id
 
 from .conftest import BASE, make_graph
 
@@ -50,7 +53,8 @@ class FakeGraph:
         self.break_value: set[str] = set()  # ids whose download dies on the wire
         self.raise_value: dict[str, Exception] = {}  # ids whose download raises this
         self.gone_links: set[str] = set()
-        self.messages: dict[str, int | str] = {}  # GET /me/messages/{id}: status or parentFolderId (FOLDER)
+        # GET /me/messages/{id}: status, parentFolderId (default FOLDER) or what it raises
+        self.messages: dict[str, int | str | Exception] = {}
         self.slow: set[str] = set()  # ids whose download completes last
         self.listing: dict[str, list[str]] = {}  # GET mailFolders/{id}/messages: ids, two per page
 
@@ -75,6 +79,8 @@ class FakeGraph:
             return httpx.Response(200, content=mime_for(msg_id))
         if path.startswith("me/messages/"):
             state = self.messages.get(path.split("/")[2], FOLDER)
+            if isinstance(state, Exception):
+                raise state
             if isinstance(state, int):
                 return httpx.Response(state, json={"error": {"code": "ErrorItemNotFound"}})
             return httpx.Response(200, json={"id": "x", "parentFolderId": state})
@@ -253,7 +259,7 @@ def test_move_seen_first_in_destination_is_not_tombstoned(
     assert db.execute("SELECT folder_id, deleted_at FROM messages").fetchone()[:] == ("F2", None)
 
 
-@pytest.mark.parametrize("status", [401, 429, 500, 503])
+@pytest.mark.parametrize("status", [401, 429])
 def test_transient_failure_is_retried_not_recorded(
     db: sqlite3.Connection, pool: ThreadPoolExecutor, status: int
 ) -> None:
@@ -323,13 +329,13 @@ def test_paused_round_still_progresses_and_resumes(db: sqlite3.Connection, pool:
 
 
 @pytest.mark.parametrize(
-    "error", [AuthUnavailable("aad busy"), AuthExpired("signed out"), httpx.ReadTimeout("stuck")]
+    "error", [AuthUnavailable("aad busy"), AuthExpired("signed out"), httpx.ConnectError("down")]
 )
 def test_one_failing_download_keeps_the_others(
     db: sqlite3.Connection, pool: ThreadPoolExecutor, error: Exception
 ) -> None:
-    """A worker failing to get a token, or stuck reading one body, fails its own download only: the
-    page's other MIME are stored before the error stops the round."""
+    """A worker failing to get a token, or to reach Graph, fails its own download only: the page's
+    other MIME are stored before the error stops the round."""
     ids = [f"m{i}" for i in range(8)]
     fake = FakeGraph([[item(i) for i in ids]])
     fake.raise_value = {"m0": error}
@@ -385,7 +391,8 @@ def test_item_whose_value_and_lookup_both_404_is_a_tombstone(
     graph = make_graph(fake)
     with capture_logs() as logs:
         assert sync_folder(graph, db, pool, FOLDER).deleted == 1
-    assert {"event": "item_gone", "folder_id": FOLDER, "log_level": "warning"} in logs
+    gone = [e for e in logs if e["event"] == "item_gone"]
+    assert [(e["path"], len(e["short_id"])) for e in gone] == [(FOLDER, 12)]
     assert local_counts(db) == {FOLDER: 1}
     row = db.execute("SELECT deleted_at, mime, mime_error FROM messages WHERE id='p1'").fetchone()
     assert row["deleted_at"] is not None and row["mime"] is None and row["mime_error"] is None
@@ -472,3 +479,141 @@ def test_reconcile_revives_a_tombstone_the_server_still_lists(
     sync_folder(graph, db, pool, FOLDER)
     assert db.execute("SELECT mime IS NOT NULL FROM messages WHERE id='m2'").fetchone()[0] == 1
     assert fake.value_calls["m2"] == 2 and fake.value_calls["m3"] == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (400, {"error": {"code": "syncStateNotFound"}}, True),
+        (410, {}, True),
+        (400, {"error": {"code": "ErrorItemNotFound"}}, False),
+        (400, {"error": "bad"}, False),
+        (400, ["x"], False),
+        (400, {"error": {"code": ["syncStateNotFound"]}}, False),
+        (400, "not json", False),
+    ],
+)
+def test_needs_resync_reads_any_error_body(status: int, body: object, expected: bool) -> None:
+    req = httpx.Request("GET", f"{BASE}/me/mailFolders/F1/messages/delta")
+    resp = (
+        httpx.Response(status, text=body, request=req)
+        if isinstance(body, str)
+        else httpx.Response(status, json=body, request=req)
+    )
+    assert mail._needs_resync(httpx.HTTPStatusError("x", request=req, response=resp)) is expected
+
+
+def test_a_404_whose_lookup_is_throttled_stops_the_round(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    fake = FakeGraph([[item("m1")]])
+    fake.fail_value, fake.messages = {"m1": 404}, {"m1": 401}
+    with pytest.raises(httpx.HTTPStatusError):
+        sync_folder(make_graph(fake), db, pool, FOLDER)
+    assert db.execute("SELECT mime_attempts, mime_error FROM messages").fetchone()[:] == (0, None)
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> list[datetime]:
+    now = [datetime(2026, 1, 1, tzinfo=UTC)]
+    monkeypatch.setattr(mail, "_utcnow", lambda: now[0])
+    return now
+
+
+def _m1(db: sqlite3.Connection) -> tuple[Any, ...]:
+    return tuple(
+        db.execute(
+            "SELECT mime IS NOT NULL, mime_error, mime_attempts FROM messages WHERE id='m1'"
+        ).fetchone()
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [500, httpx.ReadTimeout("stuck"), httpx.ReadError("reset"), httpx.RemoteProtocolError("cut mid-body")],
+)
+def test_an_item_failing_on_its_own_does_not_wedge_the_folder(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, clock: list[datetime], fault: int | Exception
+) -> None:
+    """001-AC4: a $value failing on its own leaves its MIME missing, the cursor advances and the rest
+    of the folder is archived; back-to-back rounds try it once, not once per page and catch-up."""
+    fake = FakeGraph([[item("m1")], [item("m2")]])
+    if isinstance(fault, int):
+        fake.fail_value = {"m1": fault}
+    else:
+        fake.raise_value = {"m1": fault}
+    graph = make_graph(fake)
+    with capture_logs() as logs:
+        for _ in range(3):
+            sync_folder(graph, db, pool, FOLDER)
+    assert fake.value_calls == {"m1": 1, "m2": 1}
+    assert _m1(db) == (0, None, 1)
+    assert "deltatoken" in db.execute("SELECT delta_link FROM sync_state").fetchone()[0]
+    assert len([e for e in logs if e["event"] == "mime_unavailable"]) == 1
+
+
+def test_a_ten_minute_outage_costs_no_mime(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, clock: list[datetime]
+) -> None:
+    """Rounds every 30 s through a 10-minute outage: attempts back off (0, 1, 3, 7 min), nothing is
+    recorded, and the first attempt due after recovery stores the MIME."""
+    fake = FakeGraph([[item("m1")]])
+    fake.fail_value = {"m1": 500}
+    graph = make_graph(fake)
+    start = clock[0]
+    while clock[0] < start + timedelta(minutes=10):
+        sync_folder(graph, db, pool, FOLDER)
+        clock[0] += timedelta(seconds=30)
+    assert fake.value_calls["m1"] == 4 and _m1(db) == (0, None, 4)
+    fake.fail_value = {}
+    clock[0] = start + timedelta(minutes=15)
+    sync_folder(graph, db, pool, FOLDER)
+    assert _m1(db)[:2] == (1, None)
+
+
+@pytest.mark.parametrize("fault", ["value", "lookup"])
+def test_a_persistent_failure_is_recorded_after_a_day_and_retry_failed_resets_it(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, clock: list[datetime], fault: str
+) -> None:
+    """Each attempt as soon as it is due: no mime_error before the attempts span a day (a $value 5xx,
+    or a 404 whose deletion lookup keeps failing), recorded once they do; retry_failed starts over."""
+    fake = FakeGraph([[item("m1")]])
+    fake.fail_value = {"m1": 500 if fault == "value" else 404}
+    if fault == "lookup":
+        fake.messages = {"m1": 503}
+    graph = make_graph(fake)
+    start = clock[0]
+    sync_folder(graph, db, pool, FOLDER)
+    while _m1(db)[1] is None:
+        assert clock[0] - start < timedelta(days=2)
+        clock[0] = datetime.fromisoformat(db.execute("SELECT mime_retry_at FROM messages").fetchone()[0])
+        sync_folder(graph, db, pool, FOLDER)
+    assert clock[0] - start >= timedelta(days=1)
+    assert _m1(db)[1] == "http 500" if fault == "value" else _m1(db)[1] == "http 503"
+    assert retry_failed(db) == 1
+    assert tuple(db.execute("SELECT mime_error, mime_attempts, mime_retry_at FROM messages").fetchone()) == (
+        None,
+        0,
+        None,
+    )
+    fake.fail_value, fake.messages = {}, {}
+    sync_folder(graph, db, pool, FOLDER)
+    assert _m1(db)[:2] == (1, None)
+
+
+def test_an_unparseable_mime_is_logged_with_its_short_id_only(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mail, "extract", lambda raw: Extracted(error="RecursionError"))
+    with capture_logs() as logs:
+        sync_folder(make_graph(FakeGraph([[item("m1")]])), db, pool, FOLDER)
+    failed = [e for e in logs if e["event"] == "extract_failed"]
+    assert failed == [
+        {
+            "event": "extract_failed",
+            "error": "RecursionError",
+            "short_id": short_id("m1"),
+            "log_level": "warning",
+        }
+    ]
+    assert db.execute("SELECT mime IS NOT NULL FROM messages").fetchone()[0] == 1

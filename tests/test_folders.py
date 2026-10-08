@@ -140,3 +140,19 @@ def test_vanished_folder_is_tombstoned_and_revived(db: sqlite3.Connection) -> No
     assert db.execute("SELECT deleted_at FROM folders WHERE id='B'").fetchone()[0] is not None
     sync_folders(make_graph(_handler(TREE)), db)
     assert db.execute("SELECT deleted_at FROM folders WHERE id='B'").fetchone()[0] is None
+
+
+@pytest.mark.parametrize(("folder_id", "encoded"), [("A+b=", "A%2Bb="), ("A/b=", "A%2Fb=")])
+def test_child_folder_ids_are_path_encoded(db: sqlite3.Connection, folder_id: str, encoded: str) -> None:
+    seen: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req.url.raw_path.decode())
+        if req.url.path == "/v1.0/me/mailFolders":
+            return httpx.Response(
+                200, json={"value": [{"id": folder_id, "displayName": "I", "childFolderCount": 1}]}
+            )
+        return httpx.Response(200, json={"value": []})
+
+    sync_folders(make_graph(handler), db)
+    assert seen[1].startswith(f"/v1.0/me/mailFolders/{encoded}/childFolders?")

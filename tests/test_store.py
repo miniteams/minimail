@@ -184,3 +184,62 @@ def test_reindex_rebuilds_the_event_index(tmp_path: Path) -> None:
         db.commit()
         store.rebuild_fts(db)
         assert len(db.execute("SELECT rowid FROM events_fts WHERE events_fts MATCH 'agenda'").fetchall()) == 1
+
+
+_OLD_FTS_UPDATE = """CREATE TRIGGER messages_fts_update
+       AFTER UPDATE OF subject, sender, recipients, search_text ON messages BEGIN
+         INSERT INTO messages_fts (messages_fts, rowid, subject, sender, recipients, search_text)
+         VALUES ('delete', old.rowid, old.subject, old.sender, old.recipients, old.search_text);
+         INSERT INTO messages_fts (rowid, subject, sender, recipients, search_text)
+         VALUES (new.rowid, new.subject, new.sender, new.recipients, new.search_text);
+       END"""
+
+
+def _fts_writes(db: sqlite3.Connection, sql: str) -> int:
+    before = db.total_changes
+    db.execute(sql)
+    return db.total_changes - before - 1  # the row itself; FTS5 counts its own shadow-table writes
+
+
+@pytest.mark.parametrize("migrated", [False, True])
+def test_fts_is_rewritten_only_when_an_indexed_column_changes(tmp_path: Path, migrated: bool) -> None:
+    """A metadata-only upsert (subject/sender/recipients rewritten unchanged) leaves the index alone;
+    an archive with the earlier trigger, and no mime_attempts, is migrated in place."""
+    if migrated:
+        with closing(open_db(tmp_path)) as db:
+            db.execute("DROP TRIGGER messages_fts_update")
+            db.execute(_OLD_FTS_UPDATE)
+            db.execute("ALTER TABLE messages DROP COLUMN mime_retry_at")
+            db.execute("ALTER TABLE events DROP COLUMN fetch_error")
+            db.commit()
+        with closing(store.open_readonly(tmp_path)) as reader:
+            assert store.needs_migration(reader)
+    with closing(open_db(tmp_path)) as db:
+        assert not store.needs_migration(db)
+        db.execute(
+            "INSERT INTO messages (id, folder_id, subject, sender, recipients, meta, first_seen_at, "
+            "updated_at) VALUES ('m', 'F', 'hello', 'a@example.test', '', '{}', 't', 't')"
+        )
+        db.commit()  # FTS5 flushes its pending writes here; they must not land in the counts below
+        assert _fts_writes(db, "UPDATE messages SET subject='hello', sender=sender, meta='{\"x\":1}'") == 0
+        assert _fts_writes(db, "UPDATE messages SET search_text='bonjour'") > 0
+        assert (
+            db.execute("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'bonjour'").fetchone()[0]
+            == 1
+        )
+        assert tuple(db.execute("SELECT mime_attempts, mime_retry_at FROM messages").fetchone()) == (0, None)
+        assert db.execute("SELECT fetch_error, event_attempts, event_retry_at FROM events").fetchall() == []
+
+
+def test_trigger_migration_rechecks_under_the_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Another process replacing the trigger between our check and our lock: we must not drop it again."""
+    open_db(tmp_path).close()
+    real = store._has_fts_when
+    answers = iter([False])
+
+    def has_fts_when(db: sqlite3.Connection) -> bool:
+        return next(answers, None) is not False and real(db)
+
+    monkeypatch.setattr(store, "_has_fts_when", has_fts_when)
+    with closing(open_db(tmp_path)) as db:
+        assert not store.needs_migration(db)

@@ -34,7 +34,7 @@ def walk(graph: Graph) -> Iterator[tuple[dict[str, Any], str]]:
             full = f"{prefix}/{folder['displayName']}" if prefix else folder["displayName"]
             yield folder, full
             if folder.get("childFolderCount"):
-                stack.append((f"me/mailFolders/{folder['id']}/childFolders", full))
+                stack.append((f"me/mailFolders/{path_id(folder['id'])}/childFolders", full))
 
 
 def message_count(graph: Graph, folder: dict[str, Any], path: str) -> int | None:

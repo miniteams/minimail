@@ -206,6 +206,15 @@ def test_graph_is_paced_by_max_rps(env: Path, monkeypatch: pytest.MonkeyPatch) -
     assert cli._graph(Settings())._interval == 0.5  # type: ignore[call-arg]
 
 
+@pytest.mark.parametrize("url", ["http://graph.microsoft.com/v1.0", "https://evil.test/v1.0"])
+def test_graph_url_is_not_configurable(env: Path, monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+    """Security: no setting can send the bearer token anywhere but Graph."""
+    from minimail.config import Settings
+
+    monkeypatch.setenv("MINIMAIL_GRAPH_URL", url)
+    assert cli._graph(Settings())._base == "https://graph.microsoft.com/v1.0"  # type: ignore[call-arg]
+
+
 def test_live_starts_and_retries_while_signed_out(
     env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -421,3 +430,49 @@ def test_reconcile_isolates_a_failing_folder_and_exits_1(
     monkeypatch.setattr(cli, "_graph", lambda settings: make_graph(handler))
     assert cli.main(["reconcile"]) == 1
     assert "2 folders, 1 failed, 1 messages on the server: 1 marked deleted" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("failing", ["/me/mailFolders/F1/messages/delta", "/me/calendarView/delta"])
+def test_sync_exits_1_when_a_folder_or_the_calendar_fails(
+    env: Path, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    from .test_mail import FakeGraph
+
+    fake = FakeGraph([[]])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500) if req.url.path == f"/v1.0{failing}" else fake(req)
+
+    _seed(env, monkeypatch, handler)
+    assert cli.main(["sync"]) == 1
+
+
+def test_reindex_logs_unparseable_mime_by_short_id(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from compression import zstd
+
+    from structlog.testing import capture_logs
+
+    from minimail.config import Settings
+    from minimail.mime import Extracted
+    from minimail.search import short_id
+    from minimail.store import open_db
+
+    settings = Settings()  # type: ignore[call-arg]
+    with closing(open_db(settings.data_dir)) as db:
+        db.execute(
+            "INSERT INTO messages (id, folder_id, meta, mime, first_seen_at, updated_at) "
+            "VALUES ('m1', 'F', '{}', ?, 't', 't')",
+            (zstd.compress(b"Subject: x\r\n\r\nbody"),),
+        )
+        db.commit()
+        monkeypatch.setattr(cli, "extract", lambda raw: Extracted(error="RecursionError"))
+        with capture_logs() as logs:
+            assert cli.cmd_reindex(settings, db, None) == 0  # type: ignore[arg-type]
+    assert [e for e in logs if e["event"] == "extract_failed"] == [
+        {
+            "event": "extract_failed",
+            "error": "RecursionError",
+            "short_id": short_id("m1"),
+            "log_level": "warning",
+        }
+    ]

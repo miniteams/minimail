@@ -16,7 +16,7 @@ import httpx
 import pytest
 from structlog.testing import capture_logs
 
-from minimail import calendar, cli
+from minimail import calendar, cli, mail
 from minimail.calendar import meeting_thread_id, sync_calendar, window_end
 from minimail.mime import calendar_uid, parse
 from minimail.search import short_id
@@ -60,6 +60,7 @@ class CalGraph:
         self.gets: Counter[str] = Counter()
         self.gone = False  # the delta link answers 410
         self.status: dict[str, int] = {}  # event id → status its GET answers
+        self.raise_get: dict[str, Exception] = {}  # event id → what its GET raises
 
     def __call__(self, req: httpx.Request) -> httpx.Response:
         self.urls.append(str(req.url))
@@ -67,6 +68,8 @@ class CalGraph:
         if path.startswith("me/events/"):
             event_id = path.split("/")[2]
             self.gets[event_id] += 1
+            if event_id in self.raise_get:
+                raise self.raise_get[event_id]
             if event_id in self.status:
                 return httpx.Response(self.status[event_id])
             return (
@@ -316,7 +319,7 @@ def test_an_event_refused_for_good_does_not_stop_the_round(
     assert db.execute("SELECT delta_link FROM sync_state WHERE key='calendar'").fetchone()[0]
 
 
-@pytest.mark.parametrize("status", [429, 401, 500])
+@pytest.mark.parametrize("status", [429, 401])
 def test_a_transient_event_failure_stops_the_round_before_its_cursor(
     db: sqlite3.Connection, pool: ThreadPoolExecutor, status: int
 ) -> None:
@@ -587,3 +590,98 @@ def test_all_day_events_keep_their_own_days_in_any_time_zone(
     ]
     assert cli.main(["event", "A3"]) == 0
     assert "When: Fri 2026-10-16 – Sun 2026-10-18 (all day)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fault", [500, 502, httpx.ReadTimeout("stuck"), httpx.WriteTimeout("stuck")])
+def test_an_event_failing_on_its_own_does_not_wedge_the_round(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, fault: int | Exception
+) -> None:
+    """A 5xx left after retries or a timeout on one event's GET, every time: the round stores the rest
+    and moves its cursor; the event keeps no version, so its next listing fetches it again."""
+    fake = corpus()
+    if isinstance(fault, int):
+        fake.status = {"S": fault}
+    else:
+        fake.raise_get = {"S": fault}
+    with capture_logs() as logs:
+        c = sync_calendar(make_graph(fake), db, pool, now=NOW)
+    assert c.downloaded == 2 and set(rows(db)) == {"M", "S", "X", "O1"}
+    assert rows(db)["S"]["version"] is None
+    assert [e["short_id"] for e in logs if e["event"] == "event_fetch_failed"] == [short_id("S")]
+    assert db.execute("SELECT delta_link FROM sync_state WHERE key='calendar'").fetchone()[0]
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> list[datetime]:
+    now = [datetime(2026, 1, 1, tzinfo=UTC)]
+    monkeypatch.setattr(mail, "_utcnow", lambda: now[0])
+    return now
+
+
+def _retry(db: sqlite3.Connection, event_id: str) -> tuple[Any, ...]:
+    return tuple(
+        db.execute(
+            "SELECT version, event_attempts, event_retry_at IS NOT NULL, fetch_error FROM events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+    )
+
+
+def test_failed_event_gets_back_off_and_refusals_wait_for_a_relisting(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, clock: list[datetime]
+) -> None:
+    """Delta never re-lists an unchanged event: the end-of-round refetch retries a transient failure
+    once its back-off is due (1 min, then 2), yielding to `pause`; a refused one (403) is never
+    refetched by it, only by a delta re-listing with a new changeKey."""
+    fake = corpus()
+    fake.status = {"S": 500, "X": 403}
+    graph = make_graph(fake)
+    start = clock[0]
+    sync_calendar(graph, db, pool, now=NOW)
+    for _ in range(9):
+        clock[0] += timedelta(seconds=5)
+        sync_calendar(graph, db, pool, now=NOW)
+    assert (fake.gets["S"], fake.gets["X"]) == (1, 1)
+    clock[0] = start + timedelta(minutes=1)
+    assert sync_calendar(graph, db, pool, lambda: True, now=NOW).paused
+    assert fake.gets["S"] == 1
+    sync_calendar(graph, db, pool, now=NOW)
+    sync_calendar(graph, db, pool, now=NOW)
+    assert (fake.gets["S"], _retry(db, "S")[:2]) == (2, (None, 2))
+    clock[0] = start + timedelta(minutes=2)  # the second wait is 2 min: not due yet
+    sync_calendar(graph, db, pool, now=NOW)
+    assert fake.gets["S"] == 2
+    fake.status = {"X": 403}
+    clock[0] = start + timedelta(minutes=3)
+    c = sync_calendar(graph, db, pool, now=NOW)
+    assert (c.downloaded, fake.gets["S"], fake.gets["X"]) == (1, 3, 1)
+    assert _retry(db, "S") == (SINGLE["changeKey"], 0, 0, None)
+    assert _retry(db, "X") == (None, 0, 0, "http 403")
+    for _ in range(10):
+        clock[0] += timedelta(hours=1)
+        sync_calendar(graph, db, pool, now=NOW)
+    assert fake.gets["X"] == 1
+    fake.status, fake.changes = {}, [{**EXCEPTION, "changeKey": "k9"}]
+    sync_calendar(graph, db, pool, now=NOW)
+    assert (fake.gets["X"], _retry(db, "X")) == (2, ("k9", 0, 0, None))
+
+
+def test_an_event_failing_for_a_day_is_given_up_until_relisted(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor, clock: list[datetime]
+) -> None:
+    fake = corpus()
+    fake.status = {"S": 502}
+    graph = make_graph(fake)
+    start = clock[0]
+    sync_calendar(graph, db, pool, now=NOW)
+    while _retry(db, "S")[3] is None:
+        assert clock[0] - start < timedelta(days=2)
+        clock[0] = datetime.fromisoformat(
+            db.execute("SELECT event_retry_at FROM events WHERE id='S'").fetchone()[0]
+        )
+        sync_calendar(graph, db, pool, now=NOW)
+    assert clock[0] - start >= timedelta(days=1) and _retry(db, "S")[3] == "http 502"
+    tried = fake.gets["S"]
+    clock[0] += timedelta(days=1)
+    sync_calendar(graph, db, pool, now=NOW)
+    assert fake.gets["S"] == tried
