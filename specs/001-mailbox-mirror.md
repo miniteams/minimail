@@ -1,6 +1,6 @@
 # 001 — Local mailbox + calendar mirror (`minimail sync`, `search`, `agenda`, `mcp`)
 
-**Status**: approved
+**Status**: in progress
 **Requested by**: babs
 **Date**: 2026-10-08
 
