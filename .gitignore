@@ -19,3 +19,6 @@ data/
 
 # MCP registration for local runs (per machine)
 /.mcp.json
+
+# local runners (per machine, never part of the project)
+/run-*.sh
