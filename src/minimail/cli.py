@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import os
+import signal
 import sqlite3
 import sys
 from collections.abc import Callable, Sequence
@@ -19,8 +20,9 @@ from .auth import AuthExpired, AuthUnavailable, TokenSource
 from .config import Settings
 from .folders import sync_folders
 from .graph import Graph
+from .live import Cadence, run_live, sync_pass
 from .logging import setup_logging
-from .mail import DOWNLOAD_WORKERS, Counters, local_counts, path_id, retry_failed, sync_folder
+from .mail import DOWNLOAD_WORKERS, local_counts, path_id, retry_failed
 from .mime import extract
 from .store import open_db, open_readonly
 
@@ -28,7 +30,7 @@ log = structlog.get_logger()
 
 
 def _graph(settings: Settings) -> Graph:
-    return Graph(TokenSource(settings), settings.graph_url)
+    return Graph(TokenSource(settings), settings.graph_url, max_rps=settings.max_rps)
 
 
 def _print_folders(db: sqlite3.Connection, folders: Sequence[sqlite3.Row]) -> int:
@@ -55,30 +57,41 @@ def cmd_folders(settings: Settings, db: sqlite3.Connection, args: argparse.Names
 
 
 def cmd_sync(settings: Settings, db: sqlite3.Connection, args: argparse.Namespace) -> int:
+    if args.live and args.folder:
+        print("minimail: --live syncs every folder; it does not take --folder", file=sys.stderr)
+        return 2
     graph = _graph(settings)
     executor = ThreadPoolExecutor(DOWNLOAD_WORKERS, thread_name_prefix="mime")
     clean = False
+    selected: list[sqlite3.Row] = []
     try:
-        folders = sync_folders(graph, db)
-        selected = [f for f in folders if not args.folder or f["path"] in args.folder]
-        if args.folder and len(selected) != len(set(args.folder)):
-            print(f"minimail: unknown folder path among {args.folder}", file=sys.stderr)
-            return 2
+        # --live walks the tree inside its loop, where a sign-in or network outage is retried.
+        if not args.live:
+            folders = sync_folders(graph, db)
+            selected = [f for f in folders if not args.folder or f["path"] in args.folder]
+            if args.folder and len(selected) != len(set(args.folder)):
+                print(f"minimail: unknown folder path among {args.folder}", file=sys.stderr)
+                return 2
         if args.retry_failed:
             log.info("retry_failed", reset=retry_failed(db))
-        total = Counters()
-        for folder in selected:
-            c = sync_folder(graph, db, executor, folder["id"])
-            log.info("folder_synced", path=folder["path"], **vars(c))
-            for name, value in vars(c).items():
-                setattr(total, name, getattr(total, name) + value)
-        log.info("sync_done", folders=len(selected), **vars(total))
+        if args.live:
+            run_live(
+                graph,
+                db,
+                executor,
+                Cadence(settings.inbox_every, settings.folders_every, settings.tree_every),
+            )
+        else:
+            total = sync_pass(graph, db, executor, selected)
+            log.info("sync_done", folders=len(selected), **vars(total))
         clean = True
     finally:
+        # Close first: it wakes workers asleep in a back-off or a pacing slot, so exit is prompt.
+        graph.close()
         # Interrupted: drop queued downloads instead of finishing the whole page first.
         executor.shutdown(wait=clean, cancel_futures=not clean)
-        graph.close()
-    _print_folders(db, folders if not args.folder else selected)
+    if not args.live:
+        _print_folders(db, selected)
     return 0
 
 
@@ -135,6 +148,7 @@ def _parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("folders", help="sync the folder tree; list server vs local counts")
     sync = sub.add_parser("sync", help="mirror every folder's messages (first run = full backfill)")
+    sync.add_argument("--live", action="store_true", help="keep syncing forever (Ctrl-C / SIGTERM stops)")
     sync.add_argument("--retry-failed", action="store_true", help="retry messages whose download failed")
     sync.add_argument("--folder", action="append", metavar="PATH", help="only this folder path (repeatable)")
     verify = sub.add_parser("verify", help="check every stored MIME against its sha256")
@@ -157,6 +171,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     # Security: the archive is personal data — every file this process creates is owner-only.
     os.umask(0o077)
+    # SIGTERM (systemd, kill) stops like Ctrl-C: same cleanup, same resumable cursor.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
         settings = Settings()  # type: ignore[call-arg]  # tenant_id comes from the environment
     except ValidationError as exc:
@@ -169,6 +185,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         with closing(open_db(settings.data_dir)) as db:
             return COMMANDS[args.command](settings, db, args)
+    except KeyboardInterrupt:
+        log.info("interrupted")
+        return 130
     except AuthExpired as exc:
         print(f"minimail: {exc}", file=sys.stderr)
         return 2

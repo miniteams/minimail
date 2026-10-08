@@ -114,8 +114,12 @@ is lost locally.
   extraction tests on a fixture corpus (QP, base64, latin-1, cp1252, HTML-only) green.
 
 ### Phase 3 — Delta sync and `--live`
-- Work: per-folder message delta + folder delta, tombstones, moves, metadata-only updates, cadence
-  loop (30 s / 5 min / 15 min), clean stop on SIGINT/SIGTERM.
+- Work: per-folder message delta + folder tree re-walk, tombstones, moves, metadata-only updates,
+  cadence loop (30 s / 5 min / 15 min, `MINIMAIL_{INBOX,FOLDERS,TREE}_EVERY`): tree → Inbox → other
+  folders, which yield between rounds, pages and catch-up chunks once the Inbox is due; a failing
+  folder is skipped for the rest of the pass; a failed cycle (including at start-up) is logged and
+  retried one Inbox interval later; client-side request pacing (`MINIMAIL_MAX_RPS`); clean stop on
+  SIGINT/SIGTERM (exit 130); `--live` refuses `--folder`.
 - **Covers**: AC4, AC5, AC6
 - **Data model impact**: none (`sync_state` arrives in phase 2)
 - **DoD**: live test: send self a mail → searchable < 60 s; delete/move/flag one → reflected without a
@@ -183,3 +187,28 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
 - **Calendar verbatim = raw Graph JSON** — Graph has no per-event iCalendar export.
 - **Window start = earliest event** (probed once with a wide window); end slides daily.
 - **Bounded memory**: `--live` runs forever; any per-message cache is LRU-bounded.
+- **Request pacing** (`MINIMAIL_MAX_RPS`, default 8/s): minimail borrows the Teams client's app id, so
+  Graph's per-app-per-mailbox quota (~10k requests / 10 min ≈ 16/s) is shared with the user's own
+  Teams; 8/s leaves it half. One lock-guarded slot schedule in `graph.Graph` covers every request,
+  retries and download threads included.
+- **Live pause = Inbox due, not a page count**: in `--live`, the other folders' pass checks before
+  each unit of work (a folder round, a delta page, a catch-up chunk of up to 100 missing MIME)
+  whether the Inbox is due; if so it stops and resumes, from the saved cursor, right after the Inbox
+  round. A fixed page budget cannot bound the wait: a page costs up to ~100 requests (`$value` or
+  move lookups), ~12 s at 8/s. A round's first delta page always runs, so every round progresses.
+  AC4 worst case ≈ Inbox interval (30 s) + the one unit already running when the Inbox fell due
+  (≤ ~100 requests, ~12 s at 8/s) + the Inbox round itself.
+- **A failing folder does not stop the others**: a folder round (Inbox included) failing on its own
+  — HTTP error status (folder gone, forbidden, 5xx including 503/504 left after retries), a read
+  or write timeout (one huge or stuck item), non-JSON
+  or malformed delta page, a link the client refuses — is logged; an other folder is retried once
+  at the back of the pass, then skipped until the next pass. Mailbox-wide statuses (401 after
+  re-mint, 429 after retries), sign-in errors, connection errors and SQLite operational errors abort the
+  whole cycle, which is retried one Inbox interval later. A failed tree walk aborts the cycle only
+  before the first successful walk; afterwards it is logged, the previous tree keeps serving and
+  the walk is retried one tree interval later.
+- **Delta links are checked before they are stored**: a nextLink/deltaLink off the Graph host is
+  refused before the page is applied, so it never becomes the folder's saved cursor.
+- **Throttling is per mailbox**: a 429/503/504 pushes back the next request slot of every thread, and
+  `Retry-After` is capped at 60 s. On SIGTERM/SIGINT the client is closed before the download pool
+  is drained: closing wakes every thread asleep in a back-off or a pacing slot.

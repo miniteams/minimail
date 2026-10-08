@@ -61,7 +61,7 @@ class TokenSource:
                 self._app = msal.PublicClientApplication(
                     self._settings.client_id, authority=self._settings.authority, token_cache=self._cache
                 )
-            except ValueError as exc:
+            except (ValueError, OSError) as exc:  # OSError: requests' network errors
                 raise AuthUnavailable(f"authority discovery failed: {str(exc)[:200]}") from exc
         return self._app
 
@@ -98,9 +98,14 @@ class TokenSource:
             accounts = app.get_accounts()
             if not accounts:
                 raise AuthExpired(f"no signed-in account in {self._path}: sign in with `miniteams login`")
-            result: dict[str, Any] | None = app.acquire_token_silent_with_error(
-                [scope], account=accounts[0], force_refresh=force_refresh
-            )
+            try:
+                result: dict[str, Any] | None = app.acquire_token_silent_with_error(
+                    [scope], account=accounts[0], force_refresh=force_refresh
+                )
+            except OSError as exc:
+                # msal lets requests' network errors (OSError subclasses) escape when no cached
+                # token can stand in; an unreachable AAD heals by waiting.
+                raise AuthUnavailable(f"token refresh failed: {type(exc).__name__}") from exc
             self._persist()
         if result and "access_token" in result:
             return str(result["access_token"])

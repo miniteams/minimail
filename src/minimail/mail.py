@@ -8,7 +8,7 @@ A crash re-reads at most one page; messages whose MIME is already stored are nev
 import hashlib
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from compression import zstd
 from concurrent.futures import Executor, as_completed
 from dataclasses import dataclass
@@ -19,7 +19,8 @@ from urllib.parse import quote
 import httpx
 import structlog
 
-from .graph import Graph
+from .auth import AuthExpired, AuthUnavailable
+from .graph import PAGE_SIZE, Graph
 from .mime import Extracted, extract
 
 log = structlog.get_logger()
@@ -45,6 +46,7 @@ class Counters:
     failed: int = 0
     moved: int = 0
     deleted: int = 0
+    paused: bool = False
 
 
 @dataclass
@@ -151,11 +153,11 @@ def _store_downloads(
     del futures
     # A failed download fails itself, not the page: keep storing the others, then raise so the
     # round stops and its cursor stays put. Queued downloads die with the caller's executor.
-    broken: list[httpx.HTTPError] = []
+    broken: list[Exception] = []
     for future in completed:
         try:
             s = future.result()
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, AuthExpired, AuthUnavailable) as exc:
             broken.append(exc)
             continue
         with db:
@@ -224,10 +226,18 @@ def _needs_resync(exc: httpx.HTTPStatusError) -> bool:
     return exc.response.status_code == 400 and code in _RESYNC_CODES
 
 
-def _catch_up(graph: Graph, db: sqlite3.Connection, executor: Executor, folder_id: str, c: Counters) -> None:
-    """Fetch MIME still missing in this folder. An incremental round only lists changed messages,
-    so one whose download failed transiently (or was reset by retry_failed) is otherwise never
-    seen again."""
+def _catch_up(
+    graph: Graph,
+    db: sqlite3.Connection,
+    executor: Executor,
+    folder_id: str,
+    c: Counters,
+    pause: Callable[[], bool] | None,
+) -> bool:
+    """Fetch MIME still missing in this folder, a page-sized chunk at a time; False if `pause()`
+    stopped it (the next round re-queries what is still missing). An incremental round only lists
+    changed messages, so one whose download failed transiently (or was reset by retry_failed) is
+    otherwise never seen again."""
     missing = [
         row[0]
         for row in db.execute(
@@ -238,7 +248,11 @@ def _catch_up(graph: Graph, db: sqlite3.Connection, executor: Executor, folder_i
     ]
     if missing:
         log.info("mime_catch_up", count=len(missing))
-        _store_downloads(graph, db, executor, missing, c)
+    for start in range(0, len(missing), PAGE_SIZE):
+        if pause is not None and pause():
+            return False
+        _store_downloads(graph, db, executor, missing[start : start + PAGE_SIZE], c)
+    return True
 
 
 def retry_failed(db: sqlite3.Connection) -> int:
@@ -249,14 +263,27 @@ def retry_failed(db: sqlite3.Connection) -> int:
         ).rowcount
 
 
-def sync_folder(graph: Graph, db: sqlite3.Connection, executor: Executor, folder_id: str) -> Counters:
-    """One delta round for a folder: resumes a crashed round, else continues from the last round."""
+def sync_folder(
+    graph: Graph,
+    db: sqlite3.Connection,
+    executor: Executor,
+    folder_id: str,
+    pause: Callable[[], bool] | None = None,
+) -> Counters:
+    """One delta round for a folder: resumes a crashed round, else continues from the last round.
+    Between pages, a true `pause()` ends the call with `paused` set; the saved cursor resumes it."""
     key = f"folder:{folder_id}"
     fresh = f"me/mailFolders/{path_id(folder_id)}/messages/delta?$select={SELECT}"
     row = db.execute("SELECT next_link, delta_link FROM sync_state WHERE key=?", (key,)).fetchone()
     url = (row and (row["next_link"] or row["delta_link"])) or fresh
     c = Counters()
+    first = True
     while True:
+        # The first page always runs: a round that may pause at once could never progress.
+        if not first and pause is not None and pause():
+            c.paused = True
+            return c
+        first = False
         try:
             page = graph.get(url)
         except httpx.HTTPStatusError as exc:
@@ -267,13 +294,16 @@ def sync_folder(graph: Graph, db: sqlite3.Connection, executor: Executor, folder
                 db.execute("DELETE FROM sync_state WHERE key=?", (key,))
             url = fresh
             continue
+        for link in (page.get("@odata.nextLink"), page.get("@odata.deltaLink")):
+            if link:
+                graph.url(link)  # Security: a link the client would refuse never becomes the cursor
         _apply_page(graph, db, executor, folder_id, page.get("value", []), c)
         if next_link := page.get("@odata.nextLink"):
             _save_cursor(db, key, next_link, None)
             url = next_link
         elif delta_link := page.get("@odata.deltaLink"):
             _save_cursor(db, key, None, delta_link)
-            _catch_up(graph, db, executor, folder_id, c)
+            c.paused = not _catch_up(graph, db, executor, folder_id, c, pause)
             return c
         else:
             raise RuntimeError("delta page carries neither nextLink nor deltaLink")

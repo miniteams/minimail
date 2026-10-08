@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import requests
 
 from minimail import auth
 from minimail.auth import AuthExpired, AuthUnavailable, TokenSource
@@ -93,3 +94,30 @@ def test_rotated_cache_is_written_owner_only_and_reloaded(settings: Settings, tm
 
 def test_dead_credential_set_is_stable() -> None:
     assert "invalid_grant" in auth._DEAD_CREDENTIAL
+
+
+@pytest.mark.parametrize("error", [requests.ConnectionError("no route"), requests.Timeout("slow")])
+def test_network_error_during_refresh_is_auth_unavailable(settings: Settings, error: OSError) -> None:
+    """001-AC10: AAD unreachable while no cached token can stand in is retryable, not a crash."""
+    source = _source(settings, {"access_token": "x"})
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    source._app.acquire_token_silent_with_error = boom  # type: ignore[union-attr]
+    with pytest.raises(AuthUnavailable):
+        source.token(force_refresh=True)
+
+
+def test_network_error_during_discovery_is_auth_unavailable(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """001-AC10: OIDC discovery failing on the wire (not only with a ValueError) is retryable."""
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise requests.ConnectionError("no route")
+
+    monkeypatch.setattr(auth.msal, "PublicClientApplication", boom)
+    settings.msal_cache.write_text("{}")
+    with pytest.raises(AuthUnavailable):
+        TokenSource(settings).token()

@@ -1,7 +1,9 @@
 """Shared fakes: a static token source and a routed Graph mock."""
 
 import os
-from collections.abc import Callable
+import sqlite3
+from collections.abc import Callable, Iterator
+from contextlib import closing
 from pathlib import Path
 
 import httpx
@@ -10,6 +12,7 @@ import structlog
 
 from minimail.config import Settings
 from minimail.graph import Graph
+from minimail.store import open_db
 
 BASE = "https://graph.test/v1.0"
 
@@ -36,6 +39,12 @@ def make_graph(
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(tenant_id="tenant-test", msal_cache=tmp_path / "msal.json", data_dir=tmp_path / "data")
+
+
+@pytest.fixture
+def db(tmp_path: Path) -> Iterator[sqlite3.Connection]:
+    with closing(open_db(tmp_path)) as conn:
+        yield conn
 
 
 @pytest.fixture(autouse=True)
