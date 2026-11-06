@@ -32,6 +32,9 @@ SELECT = (
 )
 # 4xx about the item itself; 401/408/429 are about the session or the moment.
 PERMANENT = frozenset({400, 403, 404, 406, 410, 413, 415, 422})
+# A message lookup by an id gone stale answers 403 ErrorAccessDenied, not 404, even when the mailbox
+# still holds the message under a new id.
+LOOKUP_GONE = frozenset({403, 404})
 # Graph allows 4 concurrent requests per mailbox per app; more only buys 429s.
 DOWNLOAD_WORKERS = 4
 # An item ($value, event GET) failing on its own is retried with back-off (1 min, doubling, capped)
@@ -157,11 +160,19 @@ def fetch_mime(graph: Graph, msg_id: str) -> Stored:
     )
 
 
+def _lookup_gone(exc: httpx.HTTPStatusError, msg_id: str) -> bool:
+    status = exc.response.status_code
+    if status == 403:
+        # A real loss of access looks the same: this line is what tells them apart afterwards.
+        log.warning("lookup_refused", short_id=short_id(msg_id))
+    return status in LOOKUP_GONE
+
+
 def _missing(graph: Graph, msg_id: str) -> bool:
     try:
         graph.get(f"me/messages/{path_id(msg_id)}", **{"$select": "id"})
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code != 404:
+        if not _lookup_gone(exc, msg_id):
             raise
         return True
     return False
@@ -206,12 +217,12 @@ def _tombstone(db: sqlite3.Connection, folder_id: str, msg_id: str) -> int:
 
 def _handle_removed(graph: Graph, db: sqlite3.Connection, folder_id: str, msg_id: str, c: Counters) -> None:
     """Delta reports both moves and deletions as `@removed`; ask Graph which one it was. Deleted =
-    404, or a parent outside the visible tree: a soft delete (Shift+Delete, emptying Deleted Items)
+    LOOKUP_GONE, or a parent outside the visible tree: a soft delete (Shift+Delete, emptying Deleted Items)
     keeps the message readable in the hidden Recoverable Items folder."""
     try:
         current = graph.get(f"me/messages/{path_id(msg_id)}", **{"$select": "id,parentFolderId"})
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code != 404:
+        if not _lookup_gone(exc, msg_id):
             raise
         c.deleted += _tombstone(db, folder_id, msg_id)
         return
@@ -473,7 +484,7 @@ def _revive(graph: Graph, db: sqlite3.Connection, folder_id: str, msg_id: str) -
     try:
         current = graph.get(f"me/messages/{path_id(msg_id)}", **{"$select": "id,parentFolderId"})
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code != 404:
+        if not _lookup_gone(exc, msg_id):
             raise
         return 0
     if current["parentFolderId"] != folder_id:
