@@ -3,9 +3,11 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import httpx
 import pytest
+from structlog.testing import capture_logs
 
 from minimail.graph import Graph, retry_delay
 
@@ -249,3 +251,21 @@ def test_read_timeout_bounds_a_stuck_read_but_not_a_large_body() -> None:
     """close() cannot interrupt a socket read: the per-read timeout bounds how long a stop waits."""
     timeout = make_graph(lambda r: httpx.Response(200))._client.timeout
     assert (timeout.read, timeout.connect) == (30.0, 10.0)
+
+
+def test_first_success_logs_connected_once() -> None:
+    """A refused call says nothing; the first success says so once, across later calls and retries."""
+    statuses = iter([403, 429, 200, 200])
+    graph = make_graph(lambda req: httpx.Response(next(statuses), json={}))
+
+    def connected(logs: list[Any]) -> int:
+        return sum(e["event"] == "graph_connected" for e in logs)
+
+    with capture_logs() as logs:
+        with pytest.raises(httpx.HTTPStatusError):
+            graph.get("me")
+        assert connected(logs) == 0
+        graph.get("me")  # 429, then 200
+        assert connected(logs) == 1
+        graph.get("me")
+        assert connected(logs) == 1

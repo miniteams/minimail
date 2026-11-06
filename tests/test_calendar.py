@@ -578,6 +578,7 @@ def test_all_day_events_keep_their_own_days_in_any_time_zone(
     fake = CalGraph([[one, span]], {"A1": full(one), "A3": full(span)})
     with closing(open_db(env / "data")) as db, ThreadPoolExecutor(2) as pool:
         sync_calendar(make_graph(fake), db, pool)
+    capsys.readouterr()  # structlog is unconfigured until cli.main: its default sink is stdout
     days = {}
     for day in range(13, 21):
         assert cli.main(["agenda", "--from", f"2026-10-{day}", "--to", f"2026-10-{day}", "--json"]) == 0

@@ -59,6 +59,7 @@ class Graph:
         self._clock = clock
         self._interval = 1.0 / max_rps if max_rps else 0.0
         self._next_slot = 0.0
+        self._connected = False
         self._pace_lock = threading.Lock()
         self._client = httpx.Client(
             # Per socket read, so large $value bodies are unaffected; bounds how long close() waits.
@@ -121,6 +122,9 @@ class Graph:
                 attempt += 1
                 continue
             resp.raise_for_status()
+            if not self._connected:
+                self._connected = True
+                log.info("graph_connected")
             return resp
 
     def get(self, path: str, *, prefer: str | None = None, **params: Any) -> dict[str, Any]:
