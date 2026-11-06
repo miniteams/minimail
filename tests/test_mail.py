@@ -199,7 +199,9 @@ def test_removed_then_404_is_tombstoned_not_dropped(db: sqlite3.Connection, pool
     sync_folder(graph, db, pool, FOLDER)
     fake.pages = [[{"id": "m1", "@removed": {"reason": "deleted"}}]]
     fake.messages = {"m1": 404}
-    assert sync_folder(graph, db, pool, FOLDER).deleted == 1
+    with capture_logs() as logs:
+        assert sync_folder(graph, db, pool, FOLDER).deleted == 1
+    assert not [e for e in logs if e["event"] == "lookup_refused"]
     row = db.execute("SELECT deleted_at, mime FROM messages WHERE id='m1'").fetchone()
     assert row["deleted_at"] is not None and row["mime"] is not None
     assert local_counts(db) == {}
@@ -617,3 +619,76 @@ def test_an_unparseable_mime_is_logged_with_its_short_id_only(
         }
     ]
     assert db.execute("SELECT mime IS NOT NULL FROM messages").fetchone()[0] == 1
+
+
+def test_removed_whose_lookup_answers_403_does_not_stop_the_round(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """001-AC5: a stale id's lookup answers 403: tombstone it, MIME kept, and the round reaches the
+    later pages instead of replaying the same `@removed` forever."""
+    fake = FakeGraph([[item("m1")]])
+    graph = make_graph(fake)
+    sync_folder(graph, db, pool, FOLDER)
+    fake.pages = [[{"id": "m1", "@removed": {"reason": "deleted"}}], [item("new")]]
+    fake.messages = {"m1": 403}
+    with capture_logs() as logs:
+        c = sync_folder(graph, db, pool, FOLDER)
+    assert (c.deleted, c.downloaded) == (1, 1)
+    assert [e["short_id"] for e in logs if e["event"] == "lookup_refused"] == [short_id("m1")]
+    row = db.execute("SELECT deleted_at, mime FROM messages WHERE id='m1'").fetchone()
+    assert row["deleted_at"] is not None and row["mime"] is not None
+    assert local_counts(db) == {FOLDER: 1}
+
+
+def test_removed_whose_lookup_answers_500_still_stops_the_round(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """001-AC5: only a 403 or 404 says the id is gone; a server fault keeps the row live and the round
+    stops, so the next one asks again."""
+    fake = FakeGraph([[item("m1")]])
+    graph = make_graph(fake)
+    sync_folder(graph, db, pool, FOLDER)
+    fake.pages = [[{"id": "m1", "@removed": {"reason": "deleted"}}], [item("new")]]
+    fake.messages = {"m1": 500}
+    with pytest.raises(httpx.HTTPStatusError):
+        sync_folder(graph, db, pool, FOLDER)
+    assert local_counts(db) == {FOLDER: 1} and "new" not in fake.value_calls
+
+
+def test_reconcile_tombstones_an_unlisted_id_whose_lookup_answers_403(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """001-AC5: reconcile shares the rule: a 403 on an id the server no longer lists is a tombstone."""
+    fake = FakeGraph([[item("m1"), item("m2")]])
+    graph = make_graph(fake)
+    sync_folder(graph, db, pool, FOLDER)
+    fake.listing = {FOLDER: ["m1"]}
+    fake.messages = {"m2": 403}
+    assert mail.reconcile_folder(graph, db, FOLDER).deleted == 1
+    assert local_counts(db) == {FOLDER: 1}
+
+
+def test_reconcile_does_not_revive_a_tombstone_whose_lookup_answers_403(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """001-AC5: a listed tombstone whose lookup answers 403 stays one, and the reconcile goes on."""
+    fake = FakeGraph([[item("m1"), item("m2")]])
+    fake.fail_value = {"m2": 404}
+    fake.messages = {"m2": 404}
+    graph = make_graph(fake)
+    sync_folder(graph, db, pool, FOLDER)
+    fake.listing = {FOLDER: ["m1", "m2"]}
+    fake.messages = {"m2": 403}
+    assert mail.reconcile_folder(graph, db, FOLDER).revived == 0
+    assert local_counts(db) == {FOLDER: 1}
+
+
+def test_value_404_whose_lookup_answers_403_is_a_tombstone(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """001-AC1: a listed id that went stale before its download never stays a live row."""
+    fake = FakeGraph([[item("m1")]])
+    fake.fail_value = {"m1": 404}
+    fake.messages = {"m1": 403}
+    assert sync_folder(make_graph(fake), db, pool, FOLDER).deleted == 1
+    assert local_counts(db) == {}

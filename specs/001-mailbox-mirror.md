@@ -126,7 +126,7 @@ is lost locally.
   (exit 130); `--live` refuses `--folder`. Reconciliation: `minimail reconcile [--folder PATH]…` and,
   in `--live`, a pass over every folder every `MINIMAIL_RECONCILE_EVERY` (default 1 day, first one a
   day after start-up), after the other folders and yielding to the Inbox like them; an item whose
-  `$value` and `GET` both 404 is a tombstone, never a live message.
+  `$value` 404 and `GET` 404 or 403 is a tombstone, never a live message.
 - **Covers**: AC4, AC5, AC6
 - **Data model impact**: none (`sync_state` arrives in phase 2)
 - **DoD**: live test: send self a mail → searchable < 60 s; delete/move/flag one → reflected without a
@@ -194,7 +194,9 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
 - **`search_text` is a dedicated decoded column**, not FTS over raw MIME — encodings would defeat it.
 - **Attachments extracted on demand** from the MIME, not stored twice.
 - **Archive semantics**: deletions are tombstones, never local deletes.
-- **Deleted = 404 or a parent outside the visible tree** (AC5): a soft delete (Shift+Delete, emptying
+- **Deleted = 404, 403 or a parent outside the visible tree** (AC5): a lookup by an id gone stale
+  answers 403 `ErrorAccessDenied`, even when the mailbox still holds the message under a new id, which
+  the delta then lists as new; each one logs `lookup_refused`. A soft delete (Shift+Delete, emptying
   Deleted Items) keeps the message readable under the hidden Recoverable Items folder, so a `@removed`
   whose `GET` answers 200 with a parent that is not a live folder of `folders` is tombstoned like a
   404 (last visible folder kept); a move into a folder newer than the last tree walk heals on that
@@ -294,14 +296,14 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
   delete (soft delete into Recoverable Items): the cursor moves past it with no `@removed`. So a
   reconcile lists each folder's ids (`messages?$select=id`, 1000 per page with a per-request
   `Prefer: odata.maxpagesize=1000`: listing is latency-bound, ~490 sequential pages for 49k ids at 100) and sends every live local id the server
-  no longer lists through the `@removed` logic (404 or hidden parent → tombstone, visible folder →
+  no longer lists through the `@removed` logic (404, 403 or hidden parent → tombstone, visible folder →
   move); a lookup also clears a false hit (a message stored after the listing). A local tombstone the
   server still lists in that folder (lookup confirms the parent) is revived: a false tombstone (a
   transient 404, a stale tree) heals and the catch-up fetches its missing MIME. Server ids stored
   nowhere are only counted: additions stay the delta's. In `--live` a unit is one listing page or up to 100
   lookups, so the AC4 bound holds; a paused folder resumes its listing, a folder failing on its own
   is skipped for that pass. Deleted Items' delta also lists non-mail items typed as messages that
-  `/messages` does not list (`$value` and `GET` 404): stored as tombstones without `mime_error`, so
+  `/messages` does not list (`$value` 404, `GET` 404 or 403): stored as tombstones without `mime_error`, so
   AC1 never counts them and a fresh round that lists them again re-checks and re-tombstones them.
 - **Delta links are checked before they are stored**: a nextLink/deltaLink off the Graph host is
   refused before the page is applied, so it never becomes the folder's saved cursor.
