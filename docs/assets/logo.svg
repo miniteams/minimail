@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="minimail">
+  <defs>
+    <clipPath id="env"><rect x="80" y="136" width="352" height="240" rx="32"/></clipPath>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#171a21"/>
+  <rect x="80" y="136" width="352" height="240" rx="32" fill="#5fd4b0"/>
+  <g clip-path="url(#env)" fill="none" stroke="#0f1115" stroke-width="28" stroke-linejoin="round">
+    <path d="M70 128l186 150 186-150"/>
+  </g>
+  <path d="M300 336h68" fill="none" stroke="#0f1115" stroke-width="28" stroke-linecap="round"/>
+</svg>

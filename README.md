@@ -1,7 +1,7 @@
 # minimail
 
 Personal, read-only local mirror of an Exchange Online mailbox and its default calendar, searchable
-offline. Sibling of [miniteams](../miniteams): same sign-in, same archive habits.
+offline. Sibling of [miniteams](https://github.com/miniteams/miniteams): same sign-in, same archive habits.
 
 ## Setup
 
@@ -92,3 +92,7 @@ claude mcp add minimail -- uv run --directory /path/to/minimail minimail mcp
 
 or a gitignored `.mcp.json` at the repo root:
 `{"mcpServers": {"minimail": {"command": "uv", "args": ["run", "minimail", "mcp"]}}}`.
+
+## License
+
+[Apache-2.0](LICENSE)

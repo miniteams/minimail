@@ -3,6 +3,8 @@ name = "minimail"
 version = "0.0.1"
 description = "Personal read-only local mirror of an Exchange Online mailbox and calendar, searchable offline."
 requires-python = ">=3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
     "msal>=1.31",
     "httpx>=0.28",
