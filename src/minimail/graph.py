@@ -14,8 +14,8 @@ import structlog
 
 log = structlog.get_logger()
 
-# Graph throttles per mailbox (429) and sheds load with 503/504; all carry Retry-After or heal soon.
-_RETRYABLE = frozenset({429, 503, 504})
+# Graph throttles per mailbox (429) and sheds load with 502/503/504; all carry Retry-After or heal soon.
+_RETRYABLE = frozenset({429, 502, 503, 504})
 # Left after retries, these are about the session or the whole mailbox, never one folder or item.
 SESSION_STATUSES = frozenset({401, 429})
 _MAX_RETRIES = 6

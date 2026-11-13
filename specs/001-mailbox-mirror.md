@@ -284,12 +284,15 @@ New SQLite archive `${MINIMAIL_DATA_DIR}/mail.db`: `folders`, `messages` (+ `ica
   it runs after the Inbox round.
 - **A failing folder does not stop the others** (one-shot `sync` too, which then exits 1): a folder
   round (Inbox included) failing on its own
-  — HTTP error status (folder gone, forbidden, 5xx including 503/504 left after retries), a read
+  — HTTP error status (folder gone, forbidden, 5xx including 502/503/504 left after retries, while a
+  probe of the mailbox still answers), a read
   or write timeout (one huge or stuck item), non-JSON
   or malformed delta page, a link the client refuses — is logged; an other folder is retried once
   at the back of the pass, then skipped until the next pass. Mailbox-wide statuses (401 after
   re-mint, 429 after retries), sign-in errors, connection errors and SQLite operational errors abort the
-  whole cycle, which is retried one Inbox interval later. A failed tree walk aborts the cycle only
+  whole cycle, which is retried one Inbox interval later, doubling per consecutive failed cycle up to
+  10 min. A 5xx whose probe (`me/mailFolders/inbox`) also fails is a Graph outage: it aborts the cycle
+  too, instead of failing every folder in turn. A failed tree walk aborts the cycle only
   before the first successful walk; afterwards it is logged, the previous tree keeps serving and
   the walk is retried one tree interval later.
 - **Reconcile beside delta**: Graph's message delta never reports a message leaving Deleted Items by a

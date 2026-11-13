@@ -22,6 +22,7 @@ CADENCE = Cadence(inbox=30.0, folders=300.0, tree=900.0)
 
 FOLDER_FAULTS = [
     (500, "HTTPStatusError"),
+    (502, "HTTPStatusError"),
     (503, "HTTPStatusError"),
     (504, "HTTPStatusError"),
     (403, "HTTPStatusError"),
@@ -423,7 +424,8 @@ def test_failing_cycle_is_logged_and_retried_one_inbox_interval_later(
     error: str,
 ) -> None:
     """001-AC10 (live): no token, AAD, Graph or the archive disk failing → logged, retried after one
-    Inbox interval (never a hot loop), and the loop recovers once healed."""
+    Inbox interval, doubling per consecutive failure (never a hot loop), and the loop recovers once
+    healed."""
     clock = Clock()
     fake = LiveGraph(clock)
     tokens = FlakyTokens()
@@ -456,8 +458,37 @@ def test_failing_cycle_is_logged_and_retried_one_inbox_interval_later(
             clock=clock,
         )
     assert [e["error"] for e in logs if e["event"] == "live_cycle_failed"] == [error] * 3
-    assert waits[:3] == [30.0, 30.0, 30.0]
-    assert _deltas(fake)[-2:] == [(90.0, "INBOX:0"), (90.0, "F2:0")]
+    assert waits[:3] == [30.0, 60.0, 120.0]
+    assert _deltas(fake)[-2:] == [(210.0, "INBOX:0"), (210.0, "F2:0")]
+
+
+def test_a_graph_outage_backs_off_the_cycle_until_it_heals(
+    db: sqlite3.Connection, pool: ThreadPoolExecutor
+) -> None:
+    """Graph answering 502 to every call is a mailbox outage, not one failure per folder: the first
+    failing round's probe aborts the cycle, retried after a doubling delay capped at 10 min; once
+    Graph heals, the loop is back to its cadence."""
+    clock = Clock()
+    fake = LiveGraph(clock)
+    fake.folders["F3"] = [[]]
+    waits: list[float] = []
+
+    def outage() -> bool:
+        if len(waits) in (1, 9):
+            fake.broken = 502  # after the start-up cycle, then again after one healthy cycle
+        if len(waits) == 8:
+            fake.broken = None
+        return len(waits) == 10
+
+    with capture_logs() as logs:
+        run_live(make_graph(fake), db, pool, CADENCE, wait=waiter(clock, waits, outage), clock=clock)
+    cycles = [e for e in logs if e["event"] == "live_cycle_failed"]
+    # Healthy again: the next outage starts over from one Inbox interval.
+    assert [e["retry_in"] for e in cycles] == [30.0, 60.0, 120.0, 240.0, 480.0, 600.0, 600.0, 30.0]
+    assert waits[1:8] == [30.0, 60.0, 120.0, 240.0, 480.0, 600.0, 600.0]
+    assert not [e for e in logs if e["event"].endswith("_round_failed")]
+    healed = sum(waits[:8])
+    assert [e for t, e in _deltas(fake) if t == healed] == ["INBOX:0", "tree", "F2:0", "F3:0"]
 
 
 def test_cycle_failure_keeps_the_folder_owed(db: sqlite3.Connection, pool: ThreadPoolExecutor) -> None:
@@ -658,3 +689,14 @@ def test_one_shot_sync_isolates_a_failing_folder(db: sqlite3.Connection, pool: T
     fake.failing = {"F2": 429}
     with pytest.raises(httpx.HTTPStatusError):
         live.sync_pass(graph, db, pool, folders)
+    fake.failing = {"F2": 502}
+    real = fake.__call__
+
+    def outage(req: httpx.Request) -> httpx.Response:
+        # Graph down: the probe of the mailbox fails like the folder.
+        return httpx.Response(502) if req.url.path.endswith("/mailFolders/inbox") else real(req)
+
+    fake.events.clear()
+    with pytest.raises(httpx.HTTPStatusError, match="mailFolders/inbox"):
+        live.sync_pass(make_graph(outage), db, pool, folders)
+    assert [e for _, e in _deltas(fake)] == ["F2:0"] * 7  # aborted at the first folder

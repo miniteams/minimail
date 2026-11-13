@@ -155,7 +155,7 @@ def cmd_reconcile(settings: Settings, db: sqlite3.Connection, args: argparse.Nam
             try:
                 c = reconcile_folder(graph, db, folder["id"])
             except FOLDER_ERRORS as exc:
-                folder_failed(exc, folder["path"], "folder_reconcile_failed")
+                folder_failed(graph, exc, folder["path"], "folder_reconcile_failed")
                 failed += 1
                 continue
             log.info("folder_reconciled", path=folder["path"], **c.summary())
