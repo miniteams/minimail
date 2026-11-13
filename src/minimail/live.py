@@ -21,8 +21,8 @@ _SUMMED = ("listed", "downloaded", "failed", "moved", "deleted")
 # A folder's own failures (gone, forbidden, 5xx, refused or malformed page) skip that folder only.
 # Read/write timeouts are tied to one item (a huge or stuck $value); connect errors mean the network.
 FOLDER_ERRORS = (httpx.HTTPStatusError, httpx.ReadTimeout, httpx.WriteTimeout, ValueError, RuntimeError)
-# SESSION_STATUSES back off the whole cycle; 503/504 stay per folder: one folder's backend can keep
-# failing while the others answer.
+# SESSION_STATUSES back off the whole cycle; a 5xx stays per folder only while the mailbox still
+# answers a probe: one folder's backend can keep failing while the others answer.
 # What a live cycle survives: sign-in and network outages, mailbox-wide throttling, Graph answering
 # garbage to the tree walk, a busy or flaky archive disk (NAS I/O, "database is locked").
 _RETRIED = (
@@ -33,6 +33,8 @@ _RETRIED = (
     RuntimeError,
     sqlite3.OperationalError,
 )
+# A failed cycle waits one Inbox interval, doubling on each consecutive failure up to this.
+_MAX_CYCLE_BACKOFF = 600.0
 
 
 @dataclass
@@ -67,7 +69,7 @@ def _attempt(
     try:
         return _round(graph, db, executor, folder, pause)
     except FOLDER_ERRORS as exc:
-        folder_failed(exc, folder["path"], "folder_round_failed")
+        folder_failed(graph, exc, folder["path"], "folder_round_failed")
         return None
 
 
@@ -79,18 +81,22 @@ def calendar_round(
     try:
         c = sync_calendar(graph, db, executor, pause)
     except FOLDER_ERRORS as exc:
-        folder_failed(exc, "(calendar)", "calendar_round_failed")
+        folder_failed(graph, exc, "(calendar)", "calendar_round_failed")
         return False
     if any(getattr(c, name) for name in _SUMMED):
         log.info("calendar_synced", **vars(c))
     return True
 
 
-def folder_failed(exc: Exception, path: str, event: str) -> None:
-    """Log a failure of the folder itself; re-raise a mailbox-wide one."""
+def folder_failed(graph: Graph, exc: Exception, path: str, event: str) -> None:
+    """Log a failure of the folder itself; re-raise a mailbox-wide one. A 5xx first probes the
+    mailbox: the probe's own failure propagates."""
     status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
     if isinstance(exc, AuthExpired | AuthUnavailable) or status in SESSION_STATUSES:
         raise exc
+    if status is not None and status >= 500:
+        # A Graph outage answers 5xx to every folder in turn: a failing probe aborts the cycle instead.
+        graph.get("me/mailFolders/inbox", **{"$select": "id"})
     log.warning(event, path=path, error=type(exc).__name__, status=status, detail=str(exc)[:200])
 
 
@@ -139,6 +145,7 @@ def run_live(
     pending: list[sqlite3.Row] = []  # other folders still owed a round in the current pass
     requeued: set[str] = set()  # failing folders already sent to the back of this pass
     walked = False
+    failures = 0  # consecutive failed cycles
 
     def inbox_due() -> bool:
         return clock() >= due_inbox
@@ -208,16 +215,19 @@ def run_live(
                         log.info("folder_reconciled", path=folder["path"], **job[1].summary())
                     except FOLDER_ERRORS as exc:
                         job = None  # a generator that raised is finished; a mailbox-wide error retries it
-                        folder_failed(exc, folder["path"], "folder_reconcile_failed")
+                        folder_failed(graph, exc, folder["path"], "folder_reconcile_failed")
                     job = None
                     to_reconcile.pop(0)
                 if not to_reconcile:
                     due_reconcile = clock() + cadence.reconcile
+            failures = 0
         except _RETRIED as exc:
-            log.warning("live_cycle_failed", error=type(exc).__name__, detail=str(exc)[:200])
+            failures += 1
+            # At least one Inbox interval, never a hot loop; doubling spares a dead endpoint.
+            delay = min(cadence.inbox * 2 ** min(failures - 1, 16), max(cadence.inbox, _MAX_CYCLE_BACKOFF))
+            log.warning("live_cycle_failed", error=type(exc).__name__, detail=str(exc)[:200], retry_in=delay)
             job = None  # restarts the folder being reconciled
-            # Every task waits at least one Inbox interval: no hot loop against a dead endpoint.
-            retry = clock() + cadence.inbox
+            retry = clock() + delay
             due_tree, due_inbox, due_folders, due_reconcile = (
                 max(d, retry) for d in (due_tree, due_inbox, due_folders, due_reconcile)
             )

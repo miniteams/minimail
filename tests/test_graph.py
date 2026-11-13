@@ -30,9 +30,9 @@ def test_retry_after_honoured_on_429_then_success() -> None:
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("status", [503, 504])
+@pytest.mark.parametrize("status", [502, 503, 504])
 def test_transient_5xx_retried_with_backoff(status: int) -> None:
-    """001-AC11: 503/504 without Retry-After back off exponentially."""
+    """001-AC11: 502/503/504 without Retry-After back off exponentially."""
     n = 0
 
     def handler(req: httpx.Request) -> httpx.Response:

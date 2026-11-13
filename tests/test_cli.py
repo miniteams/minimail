@@ -237,7 +237,7 @@ def test_live_starts_and_retries_while_signed_out(
     assert cli.main(["sync", "--live"]) == 0
     events = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
     assert [e["error"] for e in events if e["event"] == "live_cycle_failed"] == ["AuthExpired"] * 2
-    assert waits == [30.0, 30.0]
+    assert waits == [30.0, 60.0]
 
 
 def test_interrupt_closes_graph_before_draining_workers(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
